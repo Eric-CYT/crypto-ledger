@@ -277,6 +277,33 @@ dialog.dlg::backdrop { background: rgba(0, 0, 0, 0.5); }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 .holdings tfoot td, table tfoot td{white-space:nowrap}
 
+/* ---------- 篩選 / 排序列、可排序表頭 ---------- */
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+.toolbar[hidden], .toolbar .btn[hidden] { display: none; }
+.toolbar select, .toolbar input { width: auto; min-width: 0; }
+.toolbar input.q { flex: 1 1 11em; max-width: 18em; }
+.toolbar .dlab { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink-2); }
+.toolbar input[type="date"] { min-height: 36px; padding: 5px 8px; border-radius: 8px; border: 1px solid var(--axis); background: var(--surface); color: var(--ink); }
+.thsort { border: 0; background: none; padding: 0; margin: 0; font: inherit; color: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.thsort:hover { color: var(--ink); text-decoration: underline; }
+.thsort:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+.thsort.on { color: var(--ink); font-weight: 650; }
+.sarr { font-size: 12px; }
+
+/* ---------- 調整版面對話框 ---------- */
+.order-list { list-style: none; margin: 0 0 16px; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.order-item { display: flex; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: 10px; padding: 6px 8px; background: var(--surface); }
+.order-item .oname { margin-right: auto; font-weight: 550; }
+.order-item .grip { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; cursor: grab; color: var(--ink-2); touch-action: none; user-select: none; border-radius: 6px; }
+.order-item .grip:hover { background: var(--hover); }
+.order-item.dragging { background: var(--hover); border-color: var(--accent); box-shadow: 0 4px 14px rgba(0,0,0,.18); }
+.order-item.dragging .grip { cursor: grabbing; }
+@media (max-width: 760px) {
+  .toolbar .dlab { flex: 1 1 42%; }
+  .toolbar .dlab input { flex: 1; min-width: 0; }
+  .toolbar select { flex: 1 1 8em; }
+}
+
 </style>
 </head>
 <body>
@@ -326,6 +353,10 @@ function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); return
 const ICONS = {
   refresh: '<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>',
   sliders: '<line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>',
+  layout: '<rect x="3" y="3" width="18" height="5" rx="1"/><rect x="3" y="11" width="18" height="4" rx="1"/><rect x="3" y="18" width="18" height="3" rx="1"/>',
+  up: '<polyline points="18 15 12 9 6 15"/>',
+  down: '<polyline points="6 9 12 15 18 9"/>',
+  grip: '<circle cx="9" cy="6" r="1"/><circle cx="15" cy="6" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="9" cy="18" r="1"/><circle cx="15" cy="18" r="1"/>',
   lock: '<rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
   plus: '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
   edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>',
@@ -1346,7 +1377,14 @@ let session = null;      // { key, salt, iter }
 let data = null;         // 解密後的資料（只在解鎖期間存在於記憶體）
 let market = { prices: {}, unknown: [], status: 'idle', error: null, updatedAt: null, busy: false, fx: null, fxError: null };
 let hist = { closes: {}, status: 'idle', failed: [], version: 0 };
-let uiState = { txAsset: '', txType: '', chartTable: false, barsTable: false, barsMode: 'amount', retTable: false };
+function defaultUi() {
+  return {
+    txAsset: '', txType: '', txQ: '', txFrom: '', txTo: '', txSort: { key: 'ts', dir: 'desc' },
+    hQ: '', hPnl: '', hSort: { key: 'value', dir: 'desc' },
+    chartTable: false, barsTable: false, barsMode: 'amount', retTable: false,
+  };
+}
+let uiState = defaultUi();
 let dataVersion = 0;
 let seriesCache = { key: null, pts: null };
 let timers = { refresh: null, fx: null, idle: null };
@@ -1372,12 +1410,13 @@ function applyUd() {
 
 /* ---------- 資料 ---------- */
 function defaultData() {
-  return { v: 1, settings: { cur: 'USDT', method: 'avg', range: 'ALL', ud: 'red-up', fxManual: null, idleMin: 5 }, txs: [], manualPrices: {} };
+  return { v: 1, settings: { cur: 'USDT', method: 'avg', range: 'ALL', ud: 'red-up', fxManual: null, idleMin: 5, order: null }, txs: [], manualPrices: {} };
 }
 function normalize(d) {
   const out = defaultData();
   d = d || {};
   Object.assign(out.settings, d.settings || {});
+  out.settings.order = cleanOrder(out.settings.order);
   out.txs = (Array.isArray(d.txs) ? d.txs : []).filter((t) =>
     t && typeof t.id === 'string' && isFinite(t.ts) && (t.type === 'buy' || t.type === 'sell') &&
     typeof t.asset === 'string' && t.qty > 0 && isFinite(t.qty) && t.price >= 0 && isFinite(t.price)
@@ -1580,7 +1619,7 @@ function lockNow() {
   market = { prices: {}, unknown: [], status: 'idle', error: null, updatedAt: null, busy: false, fx: null, fxError: null };
   hist = { closes: {}, status: 'idle', failed: [], version: 0 };
   seriesCache = { key: null, pts: null };
-  uiState = { txAsset: '', txType: '', chartTable: false, barsTable: false, barsMode: 'amount', retTable: false };
+  uiState = defaultUi();
   Tip.hide();
   document.querySelectorAll('dialog').forEach((d) => { try { d.close(); } catch (e) { /* ignore */ } d.remove(); });
   showLock();
@@ -1601,6 +1640,7 @@ function buildShell() {
   const brand = h('div', { class: 'brand' }, logo(), '加密貨幣帳本');
   const tools = h('div', { class: 'tools' },
     h('button', { class: 'btn icon', type: 'button', 'aria-label': '重新整理價格', title: '重新整理價格', onclick: () => { refreshPrices(); refreshFx(); loadHistory(); } }, icon('refresh')),
+    h('button', { class: 'btn icon', type: 'button', 'aria-label': '調整版面順序', title: '調整版面順序', onclick: openLayoutDialog }, icon('layout')),
     h('button', { class: 'btn icon', type: 'button', 'aria-label': '設定', title: '設定', onclick: openSettings }, icon('sliders')),
     h('button', { class: 'btn icon', type: 'button', 'aria-label': '立即鎖定', title: '立即鎖定', onclick: lockNow }, icon('lock')));
   el.notices = h('div');
@@ -1613,9 +1653,105 @@ function buildShell() {
   el.alloc = h('section', { class: 'card', 'aria-label': '資產配置' });
   el.holdings = h('section', { class: 'card', 'aria-label': '持倉' });
   el.tx = h('section', { class: 'card', 'aria-label': '交易紀錄' });
+  // 持倉 / 交易紀錄：標題、篩選列、表格分開，重繪表格時不會打斷搜尋框輸入
+  el.holdHead = h('div'); el.holdBar = buildHoldBar(); el.holdBody = h('div');
+  el.holdings.appendChild(el.holdHead); el.holdings.appendChild(el.holdBar.node); el.holdings.appendChild(el.holdBody);
+  el.txHead = h('div'); el.txBar = buildTxBar(); el.txBody = h('div');
+  el.tx.appendChild(el.txHead); el.tx.appendChild(el.txBar.node); el.tx.appendChild(el.txBody);
   $root.appendChild(h('div', { class: 'page' },
     h('div', { class: 'topbar' }, brand, el.status, tools),
     el.notices, el.filters, el.summary, el.chart, el.curves, el.returns, el.bars, el.alloc, el.holdings, el.tx));
+  applyOrder(true);
+}
+
+/* ---------- 板塊順序 ---------- */
+const SECTIONS = [['summary', '資產摘要'], ['chart', '資產淨值曲線'], ['curves', '各幣種曲線'], ['returns', '各幣種報酬率變化'],
+  ['bars', '各幣種成本與損益'], ['alloc', '資產配置'], ['holdings', '持倉'], ['tx', '交易紀錄']];
+function cleanOrder(o) {
+  const keys = SECTIONS.map((x) => x[0]);
+  const out = [];
+  (Array.isArray(o) ? o : []).forEach((k) => { if (keys.indexOf(k) >= 0 && out.indexOf(k) < 0) out.push(k); });
+  keys.forEach((k) => { if (out.indexOf(k) < 0) out.push(k); });
+  return out;
+}
+/** 依設定重新排列板塊（直接搬動既有節點，不重繪）。空帳本時固定用預設順序，讓「開始記錄」提示留在最上面。 */
+function applyOrder(forceDefault) {
+  if (!el.tx || !el.tx.parentNode) return;
+  const page = el.tx.parentNode;
+  const order = forceDefault ? cleanOrder(null) : cleanOrder(data && data.settings.order);
+  order.forEach((k) => page.appendChild(el[k]));
+}
+function openLayoutDialog() {
+  if (!data.txs.length) { alertDialog('調整版面順序', '先新增至少一筆交易，畫面上才會出現各個板塊可以調整。'); return; }
+  const names = {};
+  SECTIONS.forEach((x) => { names[x[0]] = x[1]; });
+  modal((close) => {
+    const list = h('ul', { class: 'order-list' });
+    const save = (order) => { data.settings.order = order; persist(); applyOrder(); };
+    function draw(focus) {
+      clear(list);
+      const order = cleanOrder(data.settings.order);
+      order.forEach((k, i) => {
+        list.appendChild(h('li', { class: 'order-item', 'data-key': k },
+          h('span', { class: 'grip', title: '拖曳排序', 'aria-hidden': 'true' }, icon('grip')),
+          h('span', { class: 'oname' }, (i + 1) + '. ' + names[k]),
+          h('button', { class: 'btn icon small', type: 'button', 'data-act': 'up', 'aria-label': '上移「' + names[k] + '」', disabled: i === 0, onclick: () => move(k, -1) }, icon('up', 16)),
+          h('button', { class: 'btn icon small', type: 'button', 'data-act': 'down', 'aria-label': '下移「' + names[k] + '」', disabled: i === order.length - 1, onclick: () => move(k, 1) }, icon('down', 16))));
+      });
+      if (focus) {
+        let b = list.querySelector('[data-key="' + focus[0] + '"] [data-act="' + focus[1] + '"]');
+        if (!b || b.disabled) b = list.querySelector('[data-key="' + focus[0] + '"] button:not([disabled])');
+        if (b) b.focus();
+      }
+    }
+    function move(k, d) {
+      const order = cleanOrder(data.settings.order);
+      const i = order.indexOf(k), j = i + d;
+      if (j < 0 || j >= order.length) return;
+      order.splice(i, 1); order.splice(j, 0, k);
+      save(order);
+      draw([k, d < 0 ? 'up' : 'down']);
+    }
+    // 拖曳（滑鼠與觸控）：事件掛在 ul 上，搬動 li 不會中斷指標擷取
+    let drag = null;
+    list.addEventListener('pointerdown', (e) => {
+      const grip = e.target.closest && e.target.closest('.grip');
+      if (!grip) return;
+      drag = grip.closest('.order-item');
+      drag.classList.add('dragging');
+      try { list.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      e.preventDefault();
+    });
+    list.addEventListener('pointermove', (e) => {
+      if (!drag) return;
+      const items = Array.prototype.filter.call(list.children, (li) => li !== drag);
+      let before = null;
+      for (const li of items) {
+        const r = li.getBoundingClientRect();
+        if (e.clientY < r.top + r.height / 2) { before = li; break; }
+      }
+      if (before) { if (drag.nextSibling !== before) list.insertBefore(drag, before); }
+      else if (list.lastChild !== drag) list.appendChild(drag);
+    });
+    const endDrag = (commit) => {
+      if (!drag) return;
+      drag.classList.remove('dragging');
+      drag = null;
+      if (commit) save(Array.prototype.map.call(list.children, (li) => li.getAttribute('data-key')));
+      draw();
+    };
+    list.addEventListener('pointerup', () => endDrag(true));
+    list.addEventListener('pointercancel', () => endDrag(false));
+    draw();
+    return [
+      h('h2', null, '調整版面順序'),
+      h('p', { class: 'lead' }, '按 ▲▼ 或拖曳左側的把手，即可調整各板塊的上下順序。畫面會即時更新，設定會跟著加密資料一起保存與備份。'),
+      list,
+      h('div', { class: 'dlg-actions' },
+        h('button', { class: 'btn', type: 'button', onclick: () => { save(cleanOrder(null)); draw(); } }, '還原預設順序'),
+        h('button', { class: 'btn primary', type: 'button', onclick: () => close(true) }, '完成')),
+    ];
+  });
 }
 function logo() {
   const svg = s('svg', { viewBox: '0 0 24 24', width: 26, height: 26, 'aria-hidden': 'true' },
@@ -1628,6 +1764,7 @@ function renderAll() {
   const C = compute();
   applyUd();
   const empty = data.txs.length === 0;
+  applyOrder(empty);
   el.filters.hidden = empty;
   el.chart.hidden = empty; el.curves.hidden = empty; el.returns.hidden = empty; el.bars.hidden = empty; el.alloc.hidden = empty; el.holdings.hidden = empty; el.tx.hidden = empty;
   renderNotices(C);
@@ -2039,15 +2176,83 @@ function renderAlloc(C) {
   allocBar(body, C.summary.rows, { cur: C.cur, colorOf: colorOf(assetOrder()) });
 }
 
+/* ---------- 排序 / 篩選共用 ---------- */
+function isNil(x) { return x == null || (typeof x === 'number' && !isFinite(x)); }
+/** 依 getter 比較；空值一律排最後（不受升降冪影響） */
+function cmpBy(get, dir) {
+  const m = dir === 'asc' ? 1 : -1;
+  return (a, b) => {
+    const x = get(a), y = get(b);
+    if (isNil(x) && isNil(y)) return 0;
+    if (isNil(x)) return 1;
+    if (isNil(y)) return -1;
+    if (typeof x === 'string') return m * (x < y ? -1 : x > y ? 1 : 0);
+    return m * (x - y);
+  };
+}
+function nextSort(st, key, defDir) { return st.key === key ? { key: key, dir: st.dir === 'asc' ? 'desc' : 'asc' } : { key: key, dir: defDir }; }
+function sortHead(label, key, st, onSort, cls) {
+  const active = st.key === key;
+  return h('th', { class: cls || '', 'aria-sort': active ? (st.dir === 'asc' ? 'ascending' : 'descending') : 'none' },
+    h('button', { type: 'button', class: 'thsort' + (active ? ' on' : ''), title: '按一下依「' + label + '」排序', onclick: () => onSort(key) },
+      label, active ? h('span', { class: 'sarr', 'aria-hidden': 'true' }, st.dir === 'asc' ? '↑' : '↓') : null));
+}
+function dirLabel(dir) { return dir === 'asc' ? '↑ 由小到大' : '↓ 由大到小'; }
+/** 搜尋框：輸入法組字中不觸發重繪 */
+function searchInput(label, key, onInput, ph) {
+  const inp = h('input', { type: 'text', 'aria-label': label, placeholder: ph || label, autocomplete: 'off', class: 'q' });
+  let composing = false;
+  inp.addEventListener('compositionstart', () => { composing = true; });
+  inp.addEventListener('compositionend', () => { composing = false; onInput(inp.value.trim()); });
+  inp.addEventListener('input', () => { if (!composing) onInput(inp.value.trim()); });
+  return inp;
+}
+function setVal(node, v) { if (node.value !== v) node.value = v; }
+
 /* ---------- 持倉 ---------- */
+const HCOLS = [
+  ['幣種', 'asset', 'asc', (r) => r.asset], ['持有量', 'qty', 'desc', (r) => r.qty], ['平均成本', 'avgCost', 'desc', (r) => r.avgCost],
+  ['成本金額', 'cost', 'desc', (r) => r.cost], ['現價', 'price', 'desc', (r) => r.price], ['24h', 'pct', 'desc', (r) => r.pct],
+  ['市值', 'value', 'desc', (r) => r.value], ['占比', 'share', 'desc', (r) => r.share], ['未實現損益', 'unrealized', 'desc', (r) => r.unrealized],
+  ['已實現', 'realized', 'desc', (r) => r.realized]];
+const HSORT_EXTRA = [['未實現報酬率 %', 'unrealizedPct', 'desc', (r) => r.unrealizedPct]];
+function hSortDef(key) { return HCOLS.concat(HSORT_EXTRA).filter((c) => c[1] === key)[0] || HCOLS[6]; }
+function buildHoldBar() {
+  const q = searchInput('搜尋幣種', 'hq', (v) => { uiState.hQ = v; renderHoldings(lastC); }, '搜尋幣種，例如 BTC');
+  const pnl = h('select', { 'aria-label': '篩選損益', onchange: (e) => { uiState.hPnl = e.target.value; renderHoldings(lastC); } },
+    h('option', { value: '' }, '全部損益'), h('option', { value: 'gain' }, '只看獲利中'), h('option', { value: 'loss' }, '只看虧損中'));
+  const sort = h('select', { 'aria-label': '排序欄位', onchange: (e) => { uiState.hSort = { key: e.target.value, dir: hSortDef(e.target.value)[2] }; renderHoldings(lastC); } },
+    HCOLS.concat(HSORT_EXTRA).map((c) => h('option', { value: c[1] }, '排序：' + c[0])));
+  const dir = h('button', { class: 'btn small', type: 'button', 'aria-label': '切換排序方向', onclick: () => { uiState.hSort = { key: uiState.hSort.key, dir: uiState.hSort.dir === 'asc' ? 'desc' : 'asc' }; renderHoldings(lastC); } }, '');
+  const clr = h('button', { class: 'btn small', type: 'button', onclick: () => { uiState.hQ = ''; uiState.hPnl = ''; renderHoldings(lastC); } }, '清除篩選');
+  const node = h('div', { class: 'toolbar', role: 'group', 'aria-label': '持倉篩選與排序' }, q, pnl, sort, dir, clr);
+  return { node, q, pnl, sort, dir, clr };
+}
 function renderHoldings(C) {
-  clear(el.holdings);
+  C = C || lastC;
+  if (!C || !data) return;
   const S = C.summary, cur = C.cur;
-  el.holdings.appendChild(h('div', { class: 'card-head' }, h('h2', null, '持倉'),
-    h('span', { class: 'card-sub' }, '單位：' + (cur === 'TWD' ? 'TWD（價格與市值）' : 'USDT'))));
-  if (!S.rows.length) { el.holdings.appendChild(h('p', { class: 'muted' }, '目前沒有持倉。')); return; }
+  const bar = el.holdBar;
+  const active = !!(uiState.hQ || uiState.hPnl);
+  setVal(bar.q, uiState.hQ); setVal(bar.pnl, uiState.hPnl); setVal(bar.sort, uiState.hSort.key);
+  bar.dir.textContent = dirLabel(uiState.hSort.dir);
+  bar.clr.hidden = !active;
+  bar.node.hidden = !S.rows.length;
+
+  const q = uiState.hQ.toUpperCase();
+  const shown = S.rows.filter((r) =>
+    (!q || r.asset.toUpperCase().indexOf(q) >= 0) &&
+    (!uiState.hPnl || (uiState.hPnl === 'gain' ? r.unrealized > 0 : r.unrealized < 0)));
+  shown.sort(cmpBy(hSortDef(uiState.hSort.key)[3], uiState.hSort.dir));
+
+  clear(el.holdHead);
+  el.holdHead.appendChild(h('div', { class: 'card-head' }, h('h2', null, '持倉'),
+    h('span', { class: 'card-sub' }, '單位：' + (cur === 'TWD' ? 'TWD（價格與市值）' : 'USDT') + (active ? '　顯示 ' + shown.length + ' / ' + S.rows.length + ' 檔' : ''))));
+  clear(el.holdBody);
+  if (!S.rows.length) { el.holdBody.appendChild(h('p', { class: 'muted' }, '目前沒有持倉。')); return; }
+  if (!shown.length) { el.holdBody.appendChild(h('p', { class: 'muted' }, '沒有符合篩選條件的持倉。')); return; }
   const order = assetOrder(), col = colorOf(order);
-  const rows = S.rows.map((r) => {
+  const rows = shown.map((r) => {
     const c = col(r.asset);
     const needSet = r.src !== 'live';
     const priceCell = h('td', { 'data-label': '現價' },
@@ -2069,39 +2274,97 @@ function renderHoldings(C) {
         r.unrealized != null ? arrow(r.unrealized) + fmtSigned(r.unrealized, cur) + '（' + fmtPct(r.unrealizedPct, true) + '）' : '—'),
       h('td', { 'data-label': '已實現', class: signClass(r.realized) }, fmtSigned(r.realized, cur)));
   });
+  // 合計：沒篩選時用全部持倉（已實現含已清倉）；篩選時只加總顯示中的幣種
+  const sum = (f) => shown.reduce((a, r) => a + (f(r) || 0), 0);
+  const tCost = active ? sum((r) => r.cost) : S.rows.reduce((a, r) => a + r.cost, 0);
+  const tValue = active ? sum((r) => r.value) : S.value;
+  const tUnreal = active ? sum((r) => r.unrealized) : S.unrealized;
+  const tReal = active ? sum((r) => r.realized) : S.realized;
   const tfoot = h('tfoot', null, h('tr', null,
-    h('td', { 'data-label': '合計' }, '合計'), h('td'), h('td'),
-    h('td', { 'data-label': '成本金額' }, fmtMoney(S.rows.reduce((a, r) => a + r.cost, 0), cur)),
+    h('td', { 'data-label': '合計' }, active ? '合計（篩選）' : '合計'), h('td'), h('td'),
+    h('td', { 'data-label': '成本金額' }, fmtMoney(tCost, cur)),
     h('td'), h('td'),
-    h('td', { 'data-label': '市值' }, fmtMoney(S.value, cur)), h('td'),
-    h('td', { 'data-label': '未實現損益', class: signClass(S.unrealized) }, pnlText(S.unrealized, cur)),
-    h('td', { 'data-label': '已實現（含已清倉）', class: signClass(S.realized) }, fmtSigned(S.realized, cur))));
-  el.holdings.appendChild(h('div', { class: 'tablewrap' }, h('table', { class: 'rt' },
-    h('thead', null, h('tr', null, ['幣種', '持有量', '平均成本', '成本金額', '現價', '24h', '市值', '占比', '未實現損益', '已實現'].map((t) => h('th', null, t)))),
+    h('td', { 'data-label': '市值' }, fmtMoney(tValue, cur)), h('td'),
+    h('td', { 'data-label': '未實現損益', class: signClass(tUnreal) }, pnlText(tUnreal, cur)),
+    h('td', { 'data-label': active ? '已實現' : '已實現（含已清倉）', class: signClass(tReal) }, fmtSigned(tReal, cur))));
+  const onSort = (key) => { uiState.hSort = nextSort(uiState.hSort, key, hSortDef(key)[2]); renderHoldings(lastC); };
+  el.holdBody.appendChild(h('div', { class: 'tablewrap' }, h('table', { class: 'rt' },
+    h('thead', null, h('tr', null, HCOLS.map((c) => sortHead(c[0], c[1], uiState.hSort, onSort)))),
     h('tbody', null, rows), tfoot)));
 }
 
 /* ---------- 交易紀錄 ---------- */
+const TCOLS = [['時間', 'ts', 'desc'], ['類型', 'type', 'asc'], ['幣種', 'asset', 'asc'], ['數量', 'qty', 'desc'], ['價格 (USDT)', 'price', 'desc'],
+  ['金額 (USDT)', 'amount', 'desc'], ['手續費 (USDT)', 'fee', 'desc'], ['已實現損益', 'pnl', 'desc']];
+function tSortDef(key) { return TCOLS.filter((c) => c[1] === key)[0] || TCOLS[0]; }
+function txGetter(key, C) {
+  return (t) => {
+    if (key === 'amount') return t.qty * t.price;
+    if (key === 'pnl') { const ev = C.result.events[t.id]; return ev && ev.type === 'sell' ? ev.pnl : null; }
+    if (key === 'fee') return t.fee || 0;
+    return t[key];
+  };
+}
+function parseDay(v) { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v || ''); return m ? new Date(+m[1], +m[2] - 1, +m[3]).getTime() : null; }
+function buildTxBar() {
+  const rerender = () => renderTx(lastC);
+  const selA = h('select', { 'aria-label': '篩選幣種', onchange: (e) => { uiState.txAsset = e.target.value; rerender(); } });
+  const selT = h('select', { 'aria-label': '篩選類型', onchange: (e) => { uiState.txType = e.target.value; rerender(); } },
+    h('option', { value: '' }, '買入與賣出'), h('option', { value: 'buy' }, '只看買入'), h('option', { value: 'sell' }, '只看賣出'));
+  const q = searchInput('搜尋備註或幣種', 'tq', (v) => { uiState.txQ = v; rerender(); });
+  const from = h('input', { type: 'date', 'aria-label': '起始日期', onchange: (e) => { uiState.txFrom = e.target.value; rerender(); } });
+  const to = h('input', { type: 'date', 'aria-label': '結束日期', onchange: (e) => { uiState.txTo = e.target.value; rerender(); } });
+  const sort = h('select', { 'aria-label': '排序欄位', onchange: (e) => { uiState.txSort = { key: e.target.value, dir: tSortDef(e.target.value)[2] }; rerender(); } },
+    TCOLS.map((c) => h('option', { value: c[1] }, '排序：' + c[0])));
+  const dir = h('button', { class: 'btn small', type: 'button', 'aria-label': '切換排序方向', onclick: () => { uiState.txSort = { key: uiState.txSort.key, dir: uiState.txSort.dir === 'asc' ? 'desc' : 'asc' }; rerender(); } }, '');
+  const clr = h('button', { class: 'btn small', type: 'button', onclick: () => { uiState.txAsset = ''; uiState.txType = ''; uiState.txQ = ''; uiState.txFrom = ''; uiState.txTo = ''; rerender(); } }, '清除篩選');
+  const node = h('div', { class: 'toolbar', role: 'group', 'aria-label': '交易紀錄篩選與排序' },
+    selA, selT, q,
+    h('label', { class: 'dlab' }, '從', from), h('label', { class: 'dlab' }, '到', to),
+    sort, dir, clr);
+  return { node, selA, selT, q, from, to, sort, dir, clr, assetsKey: null };
+}
 function renderTx(C) {
-  clear(el.tx);
+  C = C || lastC;
+  if (!C || !data) return;
   const cur = C.cur;
   const all = data.txs;
+  const bar = el.txBar;
   const assets = Array.from(new Set(all.map((t) => t.asset))).sort();
   if (uiState.txAsset && assets.indexOf(uiState.txAsset) < 0) uiState.txAsset = '';
-  const selA = h('select', { 'aria-label': '篩選幣種', onchange: (e) => { uiState.txAsset = e.target.value; renderTx(lastC); } },
-    h('option', { value: '' }, '全部幣種'), assets.map((a) => h('option', { value: a, selected: a === uiState.txAsset }, a)));
-  const selT = h('select', { 'aria-label': '篩選類型', onchange: (e) => { uiState.txType = e.target.value; renderTx(lastC); } },
-    h('option', { value: '' }, '買入與賣出'),
-    h('option', { value: 'buy', selected: uiState.txType === 'buy' }, '只看買入'),
-    h('option', { value: 'sell', selected: uiState.txType === 'sell' }, '只看賣出'));
-  el.tx.appendChild(h('div', { class: 'card-head' },
-    h('h2', null, '交易紀錄'), h('span', { class: 'card-sub' }, all.length + ' 筆'),
-    all.length ? [selA, selT] : null,
-    h('button', { class: 'btn primary', type: 'button', onclick: () => openTxDialog() }, icon('plus'), '新增交易')));
-  if (!all.length) { el.tx.appendChild(h('p', { class: 'muted' }, '還沒有任何交易。')); return; }
+  if (bar.assetsKey !== assets.join(',')) {
+    bar.assetsKey = assets.join(',');
+    clear(bar.selA);
+    bar.selA.appendChild(h('option', { value: '' }, '全部幣種'));
+    assets.forEach((a) => bar.selA.appendChild(h('option', { value: a }, a)));
+  }
+  const active = !!(uiState.txAsset || uiState.txType || uiState.txQ || uiState.txFrom || uiState.txTo);
+  setVal(bar.selA, uiState.txAsset); setVal(bar.selT, uiState.txType); setVal(bar.q, uiState.txQ);
+  setVal(bar.from, uiState.txFrom); setVal(bar.to, uiState.txTo); setVal(bar.sort, uiState.txSort.key);
+  bar.dir.textContent = dirLabel(uiState.txSort.dir);
+  bar.clr.hidden = !active;
+  bar.node.hidden = !all.length;
 
-  const list = Engine.sortTx(all).reverse().filter((t) =>
-    (!uiState.txAsset || t.asset === uiState.txAsset) && (!uiState.txType || t.type === uiState.txType));
+  const fromTs = parseDay(uiState.txFrom), toTs = parseDay(uiState.txTo);
+  const kw = uiState.txQ.toLowerCase();
+  const filtered = Engine.sortTx(all).filter((t) =>
+    (!uiState.txAsset || t.asset === uiState.txAsset) && (!uiState.txType || t.type === uiState.txType) &&
+    (fromTs == null || t.ts >= fromTs) && (toTs == null || t.ts < toTs + DAY) &&
+    (!kw || t.asset.toLowerCase().indexOf(kw) >= 0 || (t.note || '').toLowerCase().indexOf(kw) >= 0));
+  let list;
+  if (uiState.txSort.key === 'ts') list = uiState.txSort.dir === 'desc' ? filtered.slice().reverse() : filtered;
+  else {
+    const cmp = cmpBy(txGetter(uiState.txSort.key, C), uiState.txSort.dir);
+    list = filtered.slice().reverse().sort(cmp);      // 同值時維持「新到舊」
+  }
+
+  clear(el.txHead);
+  el.txHead.appendChild(h('div', { class: 'card-head' },
+    h('h2', null, '交易紀錄'), h('span', { class: 'card-sub' }, (active ? list.length + ' / ' : '') + all.length + ' 筆'),
+    h('button', { class: 'btn primary', type: 'button', onclick: () => openTxDialog() }, icon('plus'), '新增交易')));
+  clear(el.txBody);
+  if (!all.length) { el.txBody.appendChild(h('p', { class: 'muted' }, '還沒有任何交易。')); return; }
+
   const badIds = {};
   C.result.issues.forEach((i) => { badIds[i.id] = true; });
   const twd = cur === 'TWD';
@@ -2124,11 +2387,17 @@ function renderTx(C) {
         ' ',
         h('button', { class: 'btn icon small danger', type: 'button', 'aria-label': '刪除這筆交易', title: '刪除', onclick: () => deleteTx(t) }, icon('trash', 16))));
   });
-  const heads = ['時間', '類型', '幣種', '數量', '價格 (USDT)', '金額 (USDT)', '手續費 (USDT)'].concat(twd ? ['匯率'] : [], ['已實現損益 (' + cur + ')', '備註', '']);
-  el.tx.appendChild(h('div', { class: 'tablewrap' }, h('table', { class: 'rt' },
-    h('thead', null, h('tr', null, heads.map((t, i) => h('th', { class: [0, 1, 2].indexOf(i) >= 0 || t === '備註' ? 'l' : '' }, t)))),
-    h('tbody', null, rows))));
-  if (!list.length) el.tx.appendChild(h('p', { class: 'muted' }, '沒有符合篩選條件的交易。'));
+  const onSort = (key) => { uiState.txSort = nextSort(uiState.txSort, key, tSortDef(key)[2]); renderTx(lastC); };
+  const heads = [];
+  TCOLS.forEach((c, i) => {
+    const label = c[1] === 'pnl' ? '已實現損益 (' + cur + ')' : c[0];
+    if (c[1] === 'pnl' && twd) heads.push(h('th', null, '匯率'));
+    heads.push(sortHead(label, c[1], uiState.txSort, onSort, i <= 2 ? 'l' : ''));
+  });
+  heads.push(h('th', { class: 'l' }, '備註'), h('th', null, ''));
+  el.txBody.appendChild(h('div', { class: 'tablewrap' }, h('table', { class: 'rt' },
+    h('thead', null, h('tr', null, heads)), h('tbody', null, rows))));
+  if (!list.length) el.txBody.appendChild(h('p', { class: 'muted' }, '沒有符合篩選條件的交易。'));
 }
 
 /* ---------- 新增 / 編輯 / 刪除交易 ---------- */
