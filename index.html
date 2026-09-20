@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src https://api.binance.com https://api1.binance.com https://api2.binance.com https://api3.binance.com https://data-api.binance.vision https://open.er-api.com; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src https://api.binance.com https://api1.binance.com https://api2.binance.com https://api3.binance.com https://data-api.binance.vision https://open.er-api.com https://api.github.com; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <meta name="robots" content="noindex, nofollow">
 <meta name="color-scheme" content="light dark">
@@ -304,6 +304,19 @@ dialog.dlg::backdrop { background: rgba(0, 0, 0, 0.5); }
   .toolbar select { flex: 1 1 8em; }
 }
 
+/* ---------- 雲端同步 ---------- */
+.syncchip { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.syncchip[hidden] { display: none; }
+.syncchip.ok { color: var(--ink-2); }
+.syncchip.syncing svg { animation: spin 1s linear infinite; }
+.syncchip.pending { color: var(--ink-2); font-style: italic; }
+.syncchip.error { color: var(--danger); border-color: var(--danger); }
+@keyframes spin { to { transform: rotate(360deg); } }
+.howto { margin: 6px 0 12px; font-size: 13px; color: var(--ink-2); }
+.howto summary { cursor: pointer; color: var(--accent); }
+.howto ol { margin: 8px 0 0 18px; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.codebox { width: 100%; font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; border: 1px solid var(--axis); border-radius: 8px; padding: 8px; background: var(--surface); color: var(--ink); }
+
 </style>
 </head>
 <body>
@@ -353,6 +366,7 @@ function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); return
 const ICONS = {
   refresh: '<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>',
   sliders: '<line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>',
+  cloud: '<path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/>',
   layout: '<rect x="3" y="3" width="18" height="5" rx="1"/><rect x="3" y="11" width="18" height="4" rx="1"/><rect x="3" y="18" width="18" height="3" rx="1"/>',
   up: '<polyline points="18 15 12 9 6 15"/>',
   down: '<polyline points="6 9 12 15 18 9"/>',
@@ -708,6 +722,125 @@ const Engine = (function () {
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports = Engine;
 
+/* ===== synccore.js ===== */
+/* ------------------------------------------------------------------
+ * SyncCore：雲端同步的純函式（無網路、無 DOM，可在 node 單元測試）
+ *  - 每筆交易帶 u（最後修改時間），刪除留下墓碑 deleted[id]，手動價格帶 at
+ *  - merge：兩邊各自改動後合併，以「最後修改者勝」處理同一筆的衝突
+ * ------------------------------------------------------------------ */
+const SyncCore = (function () {
+  const TX_KEYS = ['ts', 'type', 'asset', 'qty', 'price', 'fee', 'fx', 'note'];
+
+  function sameTx(a, b) {
+    return TX_KEYS.every((k) => (a[k] == null ? null : a[k]) === (b[k] == null ? null : b[k]));
+  }
+  function cleanTx(t) {
+    return { id: t.id, ts: t.ts, type: t.type, asset: t.asset, qty: t.qty, price: t.price, fee: t.fee || 0, fx: t.fx == null ? null : t.fx, note: t.note || '', u: t.u > 0 ? +t.u : 0 };
+  }
+
+  /** 本機資料 → 要同步的內容（只含交易、刪除墓碑、手動價格；不含設定與 Token） */
+  function payloadOf(d) {
+    const txs = (d.txs || []).map(cleanTx).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    const deleted = {};
+    Object.keys(d.deleted || {}).sort().forEach((id) => { deleted[id] = +d.deleted[id]; });
+    const mp = {};
+    const assets = {};
+    Object.keys(d.manualPrices || {}).forEach((a) => { assets[a] = 1; });
+    Object.keys(d.mpAt || {}).forEach((a) => { assets[a] = 1; });
+    Object.keys(assets).sort().forEach((a) => {
+      const p = d.manualPrices && d.manualPrices[a] > 0 ? +d.manualPrices[a] : null;
+      mp[a] = { p, at: (d.mpAt && +d.mpAt[a]) || 0 };
+    });
+    return { v: 1, txs, deleted, mp };
+  }
+
+  function canon(p) { return JSON.stringify(p); }
+
+  function pickNewer(a, b, key) {
+    if (!a) return b;
+    if (!b) return a;
+    if ((b[key] || 0) > (a[key] || 0)) return b;
+    if ((b[key] || 0) < (a[key] || 0)) return a;
+    // 時間相同：用內容決定，確保兩台裝置合併結果一致
+    return JSON.stringify(b) > JSON.stringify(a) ? b : a;
+  }
+
+  function merge(a, b) {
+    const deleted = {};
+    [a.deleted, b.deleted].forEach((m) => Object.keys(m || {}).forEach((id) => { deleted[id] = Math.max(deleted[id] || 0, +m[id] || 0); }));
+    const byId = {};
+    [a.txs, b.txs].forEach((list) => (list || []).forEach((t) => { byId[t.id] = pickNewer(byId[t.id], t, 'u'); }));
+    const txs = [];
+    Object.keys(byId).forEach((id) => {
+      const t = byId[id];
+      if (deleted[id] != null) {
+        if (deleted[id] >= (t.u || 0)) return;   // 刪除比最後修改新（或一樣新）→ 維持刪除
+        delete deleted[id];                       // 刪除之後又被修改 → 復活
+      }
+      txs.push(cleanTx(t));
+    });
+    txs.sort((x, y) => (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+    const mp = {};
+    const assets = {};
+    Object.keys(a.mp || {}).forEach((k) => { assets[k] = 1; });
+    Object.keys(b.mp || {}).forEach((k) => { assets[k] = 1; });
+    Object.keys(assets).sort().forEach((k) => {
+      const win = pickNewer(a.mp && a.mp[k], b.mp && b.mp[k], 'at');
+      mp[k] = { p: win.p > 0 ? +win.p : null, at: win.at || 0 };
+    });
+    const dl = {};
+    Object.keys(deleted).sort().forEach((id) => { dl[id] = deleted[id]; });
+    return { v: 1, txs, deleted: dl, mp };
+  }
+
+  /** 把合併結果寫回本機資料物件（就地修改；設定與 sync 設定不動） */
+  function applyTo(d, p) {
+    d.txs = p.txs.map((t) => Object.assign({}, t));
+    d.deleted = Object.assign({}, p.deleted);
+    d.manualPrices = {};
+    d.mpAt = {};
+    Object.keys(p.mp).forEach((k) => {
+      if (p.mp[k].p > 0) d.manualPrices[k] = p.mp[k].p;
+      if (p.mp[k].at) d.mpAt[k] = p.mp[k].at;
+    });
+    return d;
+  }
+
+  /** 本機交易清單變動時：替新增／修改的交易蓋上時間、為被刪除的留下墓碑 */
+  function stamp(oldTxs, newTxs, oldDeleted, now) {
+    const oldById = {};
+    (oldTxs || []).forEach((t) => { oldById[t.id] = t; });
+    const deleted = Object.assign({}, oldDeleted || {});
+    const seen = {};
+    const txs = newTxs.map((t) => {
+      seen[t.id] = 1;
+      const o = oldById[t.id];
+      if (o && sameTx(o, t)) return Object.assign({}, t, { u: o.u || 0 });
+      const u = Math.max(now, (deleted[t.id] || 0) + 1);
+      delete deleted[t.id];
+      return Object.assign({}, t, { u });
+    });
+    Object.keys(oldById).forEach((id) => { if (!seen[id]) deleted[id] = Math.max(now, (oldById[id].u || 0) + 1); });
+    return { txs, deleted };
+  }
+
+  /** 手動價格變動時蓋時間 */
+  function stampMp(oldMp, oldAt, newMp, now) {
+    const at = Object.assign({}, oldAt || {});
+    const keys = {};
+    Object.keys(oldMp || {}).forEach((k) => { keys[k] = 1; });
+    Object.keys(newMp || {}).forEach((k) => { keys[k] = 1; });
+    Object.keys(keys).forEach((k) => {
+      const a = oldMp && oldMp[k] > 0 ? +oldMp[k] : null, b = newMp && newMp[k] > 0 ? +newMp[k] : null;
+      if (a !== b) at[k] = Math.max(now, (at[k] || 0) + 1);
+    });
+    return at;
+  }
+
+  return { payloadOf, canon, merge, applyTo, stamp, stampMp, sameTx };
+})();
+if (typeof module !== 'undefined' && module.exports) module.exports = SyncCore;
+
 /* ===== vault.js ===== */
 /* ------------------------------------------------------------------
  * Vault：以 4 位數密碼（PBKDF2 → AES-GCM）加密後存進瀏覽器 localStorage。
@@ -798,6 +931,25 @@ const Vault = (function () {
   }
 
   function exportBackup() { return get(K_DATA); }
+  /** 以目前 session 的金鑰把指定資料封成備份（用來匯出「不含同步 Token」的備份） */
+  async function exportSealed(session, data) { return JSON.stringify(await seal(session, data)); }
+
+  /* ---- 雲端同步用：任意密碼加密／解密（與本機保險庫分開，salt 由雲端檔案決定） ---- */
+  async function newSession(pw) {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    return { key: await deriveKey(pw, salt, ITER), salt, iter: ITER };
+  }
+  async function sealWith(session, data) { return seal(session, data); }
+  /** 解開信封；若 salt 與快取的 session 相同就直接用快取金鑰（省掉 25 萬次 PBKDF2） */
+  async function openAny(env, pw, cached) {
+    if (cached && env && env.salt === toB64(cached.salt) && (env.iter || ITER) === cached.iter) {
+      let plain;
+      try { plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(env.iv) }, cached.key, fromB64(env.ct)); }
+      catch (e) { throw new Error('BAD_PIN'); }
+      return { session: cached, data: JSON.parse(dec.decode(plain)) };
+    }
+    return openEnvelope(env, pw);
+  }
 
   /** 解密備份檔（需輸入建立該備份時的密碼），回傳資料物件 */
   async function readBackup(text, pin) {
@@ -826,7 +978,7 @@ const Vault = (function () {
   }
   function clearFails() { del(K_META); }
 
-  return { supported, has, create, save, unlock, rekey, exportBackup, readBackup, reset, lockRemainingMs, recordFail, clearFails };
+  return { supported, has, create, save, unlock, rekey, exportBackup, exportSealed, newSession, sealWith, openAny, readBackup, reset, lockRemainingMs, recordFail, clearFails };
 })();
 
 /* ===== market.js ===== */
@@ -1410,7 +1562,7 @@ function applyUd() {
 
 /* ---------- 資料 ---------- */
 function defaultData() {
-  return { v: 1, settings: { cur: 'USDT', method: 'avg', range: 'ALL', ud: 'red-up', fxManual: null, idleMin: 5, order: null }, txs: [], manualPrices: {} };
+  return { v: 1, settings: { cur: 'USDT', method: 'avg', range: 'ALL', ud: 'red-up', fxManual: null, idleMin: 5, order: null }, txs: [], manualPrices: {}, deleted: {}, mpAt: {}, sync: null };
 }
 function normalize(d) {
   const out = defaultData();
@@ -1423,7 +1575,12 @@ function normalize(d) {
   ).map((t) => ({
     id: t.id, ts: +t.ts, type: t.type, asset: t.asset.toUpperCase(), qty: +t.qty, price: +t.price,
     fee: t.fee > 0 ? +t.fee : 0, fx: t.fx > 0 ? +t.fx : null, note: typeof t.note === 'string' ? t.note.slice(0, 200) : '',
+    u: t.u > 0 ? +t.u : 0,
   }));
+  for (const id in (d.deleted || {})) if (d.deleted[id] > 0) out.deleted[id] = +d.deleted[id];
+  for (const k in (d.mpAt || {})) if (d.mpAt[k] > 0) out.mpAt[k.toUpperCase()] = +d.mpAt[k];
+  const sy = d.sync;
+  if (sy && sy.owner && sy.repo && sy.token && sy.pw) out.sync = { owner: String(sy.owner), repo: String(sy.repo), token: String(sy.token), pw: String(sy.pw), path: 'ledger.sync.json' };
   const mp = d.manualPrices || {};
   for (const k in mp) if (mp[k] > 0) out.manualPrices[k.toUpperCase()] = +mp[k];
   return out;
@@ -1432,6 +1589,7 @@ function persist() {
   const snap = JSON.parse(JSON.stringify(data));
   const sess = session;
   saveChain = saveChain.then(() => Vault.save(sess, snap)).catch(() => toast('儲存失敗：瀏覽器可能已禁止儲存或空間已滿'));
+  if (typeof syncNote === 'function') syncNote();
   return saveChain;
 }
 function touchData() { dataVersion++; seriesCache = { key: null, pts: null }; }
@@ -1611,11 +1769,13 @@ function startTimers() {
   stopTimers();
   timers.refresh = setInterval(() => { if (document.visibilityState === 'visible') refreshPrices(); }, 30000);
   timers.fx = setInterval(refreshFx, 3600000);
+  timers.sync = setInterval(() => { if (document.visibilityState === 'visible' && syncCfg()) runSync('poll'); }, 60000);
 }
-function stopTimers() { clearInterval(timers.refresh); clearInterval(timers.fx); clearTimeout(timers.idle); }
+function stopTimers() { clearInterval(timers.refresh); clearInterval(timers.fx); clearInterval(timers.sync); clearTimeout(timers.idle); }
 function lockNow() {
   stopTimers();
   session = null; data = null; lastC = null;
+  syncReset();
   market = { prices: {}, unknown: [], status: 'idle', error: null, updatedAt: null, busy: false, fx: null, fxError: null };
   hist = { closes: {}, status: 'idle', failed: [], version: 0 };
   seriesCache = { key: null, pts: null };
@@ -1638,6 +1798,7 @@ function buildShell() {
   el.statusText = h('span', null, '');
   el.status = h('span', { class: 'status', role: 'status' }, el.statusDot, el.statusText);
   const brand = h('div', { class: 'brand' }, logo(), '加密貨幣帳本');
+  el.syncChip = h('button', { class: 'btn small syncchip', type: 'button', hidden: true, onclick: () => runSync('manual') }, icon('cloud', 15), h('span', { class: 'txt' }, ''));
   const tools = h('div', { class: 'tools' },
     h('button', { class: 'btn icon', type: 'button', 'aria-label': '重新整理價格', title: '重新整理價格', onclick: () => { refreshPrices(); refreshFx(); loadHistory(); } }, icon('refresh')),
     h('button', { class: 'btn icon', type: 'button', 'aria-label': '調整版面順序', title: '調整版面順序', onclick: openLayoutDialog }, icon('layout')),
@@ -1659,9 +1820,10 @@ function buildShell() {
   el.txHead = h('div'); el.txBar = buildTxBar(); el.txBody = h('div');
   el.tx.appendChild(el.txHead); el.tx.appendChild(el.txBar.node); el.tx.appendChild(el.txBody);
   $root.appendChild(h('div', { class: 'page' },
-    h('div', { class: 'topbar' }, brand, el.status, tools),
+    h('div', { class: 'topbar' }, brand, el.status, el.syncChip, tools),
     el.notices, el.filters, el.summary, el.chart, el.curves, el.returns, el.bars, el.alloc, el.holdings, el.tx));
   applyOrder(true);
+  updateSyncChip();
 }
 
 /* ---------- 板塊順序 ---------- */
@@ -1812,6 +1974,7 @@ function renderNotices(C) {
     const i = C.result.issues[0];
     list.push(notice('有 ' + C.result.issues.length + ' 筆賣出超過當時持有量（例如 ' + i.asset + '），請檢查交易紀錄。'));
   }
+  if (syncSt.status === 'error' && syncSt.code !== 'NETWORK' && syncSt.code !== 'RATE') list.push(notice('雲端同步失敗：' + syncSt.error, ['重試', () => runSync('manual')]));
   list.forEach((n) => el.notices.appendChild(n));
 }
 
@@ -2402,7 +2565,8 @@ function renderTx(C) {
 
 /* ---------- 新增 / 編輯 / 刪除交易 ---------- */
 function applyTxs(next) {
-  data.txs = next;
+  const st = SyncCore.stamp(data.txs, next, data.deleted, Date.now());
+  data.txs = st.txs; data.deleted = st.deleted;
   touchData();
   persist();
   renderAll();
@@ -2520,6 +2684,11 @@ function openTxDialog(edit) {
 }
 
 /* ---------- 手動價格 ---------- */
+function setManualPrice(asset, v) {
+  const before = Object.assign({}, data.manualPrices);
+  if (v > 0) data.manualPrices[asset] = v; else delete data.manualPrices[asset];
+  data.mpAt = SyncCore.stampMp(before, data.mpAt, data.manualPrices, Date.now());
+}
 function openPriceDialog(asset) {
   return modal((close) => {
     const inp = numInput('mp', data.manualPrices[asset] || '', '例如 1.25');
@@ -2527,16 +2696,298 @@ function openPriceDialog(asset) {
     const save = () => {
       const v = parseFloat(inp.value);
       if (!(v > 0)) { err.textContent = '請輸入大於 0 的價格。'; return; }
-      data.manualPrices[asset] = v; persist(); close(true); renderLive();
+      setManualPrice(asset, v); persist(); close(true); renderLive();
     };
     return [
       h('h2', null, '設定 ' + asset + ' 價格'),
       h('p', { class: 'lead' }, '幣安沒有即時報價時，使用這個價格估值（USDT）。有即時報價後會自動以即時價為準。'),
       field('價格 (USDT)', inp, null, 'mp'), err,
       h('div', { class: 'dlg-actions' },
-        data.manualPrices[asset] ? h('button', { class: 'btn danger', type: 'button', onclick: () => { delete data.manualPrices[asset]; persist(); close(true); renderLive(); } }, '清除手動價格') : null,
+        data.manualPrices[asset] ? h('button', { class: 'btn danger', type: 'button', onclick: () => { setManualPrice(asset, null); persist(); close(true); renderLive(); } }, '清除手動價格') : null,
         h('button', { class: 'btn', type: 'button', onclick: () => close(false) }, '取消'),
         h('button', { class: 'btn primary', type: 'button', onclick: save }, '儲存')),
+    ];
+  });
+}
+
+/* ===== app-sync.js ===== */
+/* ------------------------------------------------------------------
+ * 雲端同步：把「加密後」的帳本存進你自己的 GitHub 私人 repo（ledger.sync.json），
+ * 多台裝置各自開網頁、貼上同一組設定，就會自動合併。
+ *  - 交易、刪除、手動價格會同步；顯示設定（幣別、版面順序、主題…）各裝置獨立
+ *  - Token 與同步密碼只存在本機加密的保險庫裡，不會寫進雲端檔案
+ * ------------------------------------------------------------------ */
+const SYNC_PATH = 'ledger.sync.json';
+function freshSync() { return { status: 'off', at: null, error: null, code: null, busy: false, timer: null, lastCanon: null, cache: null, lastTry: 0 }; }
+let syncSt = freshSync();
+
+function syncCfg() {
+  const s = data && data.sync;
+  return s && s.token && s.owner && s.repo && s.pw ? s : null;
+}
+function syncReset() { clearTimeout(syncSt.timer); syncSt = freshSync(); }
+function syncErr(code, msg) { const e = new Error(msg); e.code = code; return e; }
+
+async function gh(cfg, method, path, body, headers) {
+  try {
+    return await fetch('https://api.github.com' + path, {
+      method, cache: 'no-store',
+      headers: Object.assign({ Authorization: 'Bearer ' + cfg.token, Accept: 'application/vnd.github+json' }, body ? { 'Content-Type': 'application/json' } : {}, headers || {}),
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (e) { throw syncErr('NETWORK', '連不上 GitHub，請檢查網路連線'); }
+}
+async function ghErr(res) {
+  let msg = '';
+  try { msg = (await res.json()).message || ''; } catch (e) { /* ignore */ }
+  if (res.status === 401) return syncErr('AUTH', 'GitHub Token 無效或已過期，請重新產生並貼上新的 Token');
+  if (res.status === 403) {
+    if (res.headers.get('x-ratelimit-remaining') === '0') return syncErr('RATE', 'GitHub 暫時限制請求次數，稍後會自動重試');
+    return syncErr('PERM', 'Token 權限不足：請確認它已授權這個 repo 的「Contents：Read and write」');
+  }
+  if (res.status === 404) return syncErr('NOTFOUND', '找不到這個 repo，或 Token 沒有它的權限（請確認帳號／repo 名稱）');
+  return syncErr('HTTP', 'GitHub 回應 ' + res.status + (msg ? '：' + msg : ''));
+}
+async function ghCheckRepo(cfg) {
+  const res = await gh(cfg, 'GET', '/repos/' + cfg.owner + '/' + cfg.repo);
+  if (!res.ok) throw await ghErr(res);
+  const j = await res.json();
+  if (j.private !== true) throw syncErr('PUBLIC', '這個 repo 是公開的！同步檔案請放在「私人（Private）」repo，避免任何人都能下載。');
+  if (j.permissions && j.permissions.push === false) throw syncErr('PERM', 'Token 對這個 repo 只有讀取權限，請授權「Contents：Read and write」');
+}
+async function ghGetFile(cfg) {
+  const path = '/repos/' + cfg.owner + '/' + cfg.repo + '/contents/' + SYNC_PATH;
+  const res = await gh(cfg, 'GET', path);
+  if (res.status === 404) return { sha: null, env: null };
+  if (!res.ok) throw await ghErr(res);
+  const j = await res.json();
+  let text;
+  if (j.encoding === 'base64' && j.content) text = atob(String(j.content).replace(/\s/g, ''));
+  else {
+    const raw = await gh(cfg, 'GET', path, null, { Accept: 'application/vnd.github.raw+json' });
+    if (!raw.ok) throw await ghErr(raw);
+    text = await raw.text();
+  }
+  let env;
+  try { env = JSON.parse(text); } catch (e) { throw syncErr('FORMAT', '雲端的 ledger.sync.json 不是有效的同步檔'); }
+  return { sha: j.sha, env };
+}
+async function ghPutFile(cfg, env, sha) {
+  const body = { message: 'sync ' + new Date().toISOString(), content: btoa(JSON.stringify(env)) };
+  if (sha) body.sha = sha;
+  const res = await gh(cfg, 'PUT', '/repos/' + cfg.owner + '/' + cfg.repo + '/contents/' + SYNC_PATH, body);
+  if (res.status === 409 || res.status === 422) throw syncErr('CONFLICT', '雲端資料剛被其他裝置更新');
+  if (!res.ok) throw await ghErr(res);
+}
+
+async function openRemote(cfg, env) {
+  try {
+    const r = await Vault.openAny(env, cfg.pw, syncSt.cache);
+    syncSt.cache = r.session;
+    return r.data;
+  } catch (e) {
+    if (e.message === 'BAD_PIN') throw syncErr('BADPW', '同步密碼與雲端資料不符。請輸入建立雲端資料時設定的同步密碼。');
+    throw syncErr('FORMAT', '雲端的 ledger.sync.json 不是有效的同步檔');
+  }
+}
+async function sealRemote(cfg, payload) {
+  if (!syncSt.cache) syncSt.cache = await Vault.newSession(cfg.pw);
+  return Vault.sealWith(syncSt.cache, payload);
+}
+
+function setSyncStatus(st, err) {
+  syncSt.status = st;
+  syncSt.error = err ? err.message : null;
+  syncSt.code = err ? err.code || 'ERR' : null;
+  updateSyncChip();
+  if (data && lastC && el.notices) renderNotices(lastC);
+}
+
+/** 抓雲端 → 合併 → 寫回本機／雲端。回傳 { ok, err, changed }。 */
+async function runSync(reason) {
+  const first = syncCfg();
+  if (!first) return { ok: false, err: null };
+  if (syncSt.busy) return { ok: false, err: null, busy: true };
+  syncSt.busy = true; syncSt.lastTry = Date.now();
+  clearTimeout(syncSt.timer);
+  setSyncStatus('syncing');
+  let changed = false;
+  try {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const cfg = syncCfg();
+      if (!cfg) return { ok: false, err: null };
+      const remote = await ghGetFile(cfg);
+      if (!data) return { ok: false, err: null };
+      const remoteP = remote.env ? await openRemote(cfg, remote.env) : null;
+      if (!data) return { ok: false, err: null };
+      const localP = SyncCore.payloadOf(data);
+      const merged = remoteP ? SyncCore.merge(localP, remoteP) : localP;
+      if (SyncCore.canon(merged) !== SyncCore.canon(localP)) { applyRemote(merged); changed = true; }
+      if (!remoteP || SyncCore.canon(merged) !== SyncCore.canon(remoteP)) {
+        try { await ghPutFile(cfg, await sealRemote(cfg, merged), remote.sha); }
+        catch (e) { if (e.code === 'CONFLICT' && attempt < 3) continue; throw e; }
+      }
+      if (!data) return { ok: false, err: null };
+      syncSt.lastCanon = SyncCore.canon(merged);
+      syncSt.at = Date.now();
+      setSyncStatus('ok');
+      return { ok: true, changed };
+    }
+    throw syncErr('CONFLICT', '同步時一直與其他裝置衝突，請稍後再試');
+  } catch (e) {
+    if (data) setSyncStatus('error', e);
+    return { ok: false, err: e };
+  } finally {
+    syncSt.busy = false;
+    if (data) syncNote();
+  }
+}
+
+/** 把合併結果寫回本機並重繪 */
+function applyRemote(merged) {
+  SyncCore.applyTo(data, merged);
+  data.txs = normalize({ txs: data.txs }).txs;
+  syncSt.lastCanon = SyncCore.canon(merged);
+  touchData(); hist.version++;
+  persist();
+  renderAll();
+  loadHistory();
+  refreshPrices();
+  toast('已同步其他裝置的更新');
+}
+
+/** 本機資料有變動 → 稍後自動上傳 */
+function syncNote() {
+  if (!syncCfg() || !data) return;
+  if (SyncCore.canon(SyncCore.payloadOf(data)) === syncSt.lastCanon) return;
+  if (syncSt.busy || syncSt.status === 'error') return;   // 出錯時不連環重試，交給每分鐘輪詢或手動重試
+  clearTimeout(syncSt.timer);
+  syncSt.timer = setTimeout(() => runSync('local'), 1500);
+  if (syncSt.status !== 'error') { syncSt.status = 'pending'; updateSyncChip(); }
+}
+
+function updateSyncChip() {
+  const c = el.syncChip;
+  if (!c) return;
+  const cfg = syncCfg();
+  c.hidden = !cfg;
+  if (!cfg) return;
+  const st = syncSt.status;
+  c.className = 'btn small syncchip ' + st;
+  c.querySelector('.txt').textContent =
+    st === 'syncing' ? '同步中…' : st === 'ok' ? '已同步 ' + fmtTime(syncSt.at) : st === 'error' ? '同步失敗' : st === 'pending' ? '待同步' : '雲端同步';
+  c.title = st === 'error' ? syncSt.error + '（點一下重試）' : '雲端同步：' + cfg.owner + '/' + cfg.repo + '（點一下立即同步）';
+}
+
+/* ---------- 同步設定碼（方便把設定貼到另一台裝置） ---------- */
+function encodeSetup(cfg) {
+  const bytes = new TextEncoder().encode(JSON.stringify({ o: cfg.owner, r: cfg.repo, t: cfg.token, p: cfg.pw }));
+  let bin = ''; bytes.forEach((b) => { bin += String.fromCharCode(b); });
+  return 'cl1:' + btoa(bin);
+}
+function decodeSetup(code) {
+  const m = /^cl1:([A-Za-z0-9+/=]+)$/.exec((code || '').trim());
+  if (!m) throw new Error('這不是有效的同步設定碼');
+  try {
+    const bin = atob(m[1]);
+    const o = JSON.parse(new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0))));
+    if (!o.o || !o.r || !o.t || !o.p) throw new Error('x');
+    return { repo: o.o + '/' + o.r, token: o.t, pw: o.p };
+  } catch (e) { throw new Error('同步設定碼已損毀或不完整'); }
+}
+
+async function connectSync(f) {
+  const repoStr = (f.repo || '').trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\.git$/i, '').replace(/\/+$/, '');
+  const m = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/.exec(repoStr);
+  if (!m) throw new Error('Repo 請輸入「帳號/名稱」，例如 Eric-CYT/crypto-ledger-data');
+  const token = (f.token || '').trim();
+  if (token.length < 20) throw new Error('請貼上完整的 GitHub Token（通常以 github_pat_ 開頭）');
+  const pw = f.pw || '';
+  if (pw.length < 4) throw new Error('同步密碼至少 4 個字元');
+  const cfg = { owner: m[1], repo: m[2], token, pw, path: SYNC_PATH };
+  await ghCheckRepo(cfg);
+  const prev = data.sync;
+  data.sync = cfg; syncSt.cache = null; syncSt.lastCanon = null;
+  const r = await runSync('connect');
+  if (!r.ok) {
+    data.sync = prev || null; syncSt.cache = null; syncSt.status = prev ? 'idle' : 'off'; updateSyncChip();
+    throw r.err || new Error('同步失敗');
+  }
+  await persist();
+  updateSyncChip();
+  return r;
+}
+
+function syncSection() {
+  const box = h('div', { class: 'sec' });
+  const msg = h('div', { class: 'err', role: 'alert' });
+  const paint = () => {
+    clear(box);
+    const cfg = syncCfg();
+    box.appendChild(h('h3', null, '雲端同步（手機與電腦）'));
+    if (cfg) {
+      box.appendChild(h('p', { class: 'hint muted' },
+        '已連線：' + cfg.owner + '/' + cfg.repo + '　' + (syncSt.at ? '上次同步 ' + fmtDT(syncSt.at) : '尚未同步') + '。交易、刪除與手動價格會自動同步；幣別、版面順序等顯示設定各裝置獨立。'));
+      box.appendChild(h('div', { class: 'btnrow' },
+        h('button', { class: 'btn', type: 'button', onclick: async () => { msg.textContent = ''; const r = await runSync('manual'); if (!r.ok && r.err) msg.textContent = r.err.message; else toast('已同步'); paint(); } }, '立即同步'),
+        h('button', { class: 'btn', type: 'button', onclick: () => showSetupCode(cfg) }, '顯示同步設定碼'),
+        h('button', { class: 'btn danger', type: 'button', onclick: async () => {
+          const ok = await confirmDialog({ title: '中斷雲端同步？', body: '這台裝置會忘記 Token 與同步密碼，之後不再上傳或下載。雲端檔案與其他裝置不受影響，本機資料也會保留。', confirm: '中斷同步', danger: true });
+          if (!ok) return;
+          data.sync = null; syncReset(); persist(); updateSyncChip(); if (lastC) renderNotices(lastC); paint();
+        } }, '中斷同步')));
+    } else {
+      const inCode = h('input', { type: 'text', id: 'sy-code', placeholder: '貼上在另一台裝置複製的「同步設定碼」（cl1:…）', autocomplete: 'off' });
+      const inRepo = h('input', { type: 'text', id: 'sy-repo', placeholder: '帳號/repo 名稱，例如 Eric-CYT/crypto-ledger-data', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false' });
+      const inTok = h('input', { type: 'password', id: 'sy-tok', placeholder: 'github_pat_…', autocomplete: 'off' });
+      const inPw = h('input', { type: 'password', id: 'sy-pw', placeholder: '至少 4 碼；可沿用你的 4 位數密碼，設更長更安全', autocomplete: 'off' });
+      const btn = h('button', { class: 'btn primary', type: 'button', onclick: async () => {
+        msg.textContent = '';
+        btn.disabled = true; btn.textContent = '連線中…';
+        try { await connectSync({ repo: inRepo.value, token: inTok.value, pw: inPw.value }); toast('已連線並同步'); paint(); }
+        catch (e) { msg.textContent = e.message; btn.disabled = false; btn.textContent = '連線並同步'; }
+      } }, '連線並同步');
+      box.appendChild(h('p', { class: 'hint muted' }, '把「加密後」的帳本存到你自己的 GitHub 私人 repo，手機與電腦各自開網頁、填同一組設定就會自動合併。'));
+      box.appendChild(h('details', { class: 'howto' },
+        h('summary', null, '第一次設定怎麼做？（約 3 分鐘）'),
+        h('ol', null,
+          h('li', null, '在 GitHub 按右上角「+」→ New repository，名稱例如 crypto-ledger-data，選 ', h('b', null, 'Private（私人）'), '，勾選「Add a README file」，建立。'),
+          h('li', null, '右上角頭像 → Settings → 最下方 Developer settings → Personal access tokens → Fine-grained tokens → Generate new token。'),
+          h('li', null, 'Repository access 選「Only select repositories」並選剛建立的那個 repo；Permissions → Repository permissions → ', h('b', null, 'Contents 設為 Read and write'), '；Generate 後複製 Token（只會顯示一次）。'),
+          h('li', null, '回到這裡貼上 repo 名稱與 Token，並設定同步密碼。第二台裝置只要貼「同步設定碼」即可。'))));
+      box.appendChild(h('div', { class: 'field' }, h('label', { for: 'sy-code' }, '同步設定碼（選填）'),
+        h('div', { class: 'inline' }, inCode, h('button', { class: 'btn', type: 'button', onclick: () => {
+          msg.textContent = '';
+          try { const o = decodeSetup(inCode.value); inRepo.value = o.repo; inTok.value = o.token; inPw.value = o.pw; inCode.value = ''; toast('已帶入設定，按「連線並同步」'); }
+          catch (e) { msg.textContent = e.message; }
+        } }, '套用'))));
+      box.appendChild(h('div', { class: 'field' }, h('label', { for: 'sy-repo' }, 'GitHub 私人 repo'), inRepo));
+      box.appendChild(h('div', { class: 'field' }, h('label', { for: 'sy-tok' }, 'GitHub Token（只需該 repo 的 Contents 讀寫）'), inTok));
+      box.appendChild(h('div', { class: 'field' }, h('label', { for: 'sy-pw' }, '同步密碼（用來加密雲端檔案，兩台裝置要相同）'), inPw));
+      box.appendChild(btn);
+      box.appendChild(h('p', { class: 'hint muted', style: { marginTop: '8px' } },
+        '同步密碼若只有 4 位數，雲端檔案一旦外流就很容易被破解；repo 務必維持私人，並保護好你的 GitHub 帳號。忘記同步密碼無法找回（可中斷後重建雲端檔案）。'));
+    }
+    box.appendChild(msg);
+  };
+  paint();
+  return box;
+}
+function showSetupCode(cfg) {
+  return modal((close) => {
+    const code = encodeSetup(cfg);
+    const ta = h('textarea', { readonly: '', rows: 4, class: 'codebox', 'aria-label': '同步設定碼' });
+    ta.value = code;
+    return [
+      h('h2', null, '同步設定碼'),
+      h('p', { class: 'lead' }, '在另一台裝置的「設定 → 雲端同步」貼上這串碼，就不用手動輸入 Token。'),
+      h('p', { class: 'hint', style: { color: 'var(--st-bad)' } }, '這串碼包含你的 GitHub Token 與同步密碼，等於鑰匙：只傳給自己，貼完就把訊息刪掉，不要貼到公開的地方。'),
+      ta,
+      h('div', { class: 'dlg-actions' },
+        h('button', { class: 'btn', type: 'button', onclick: async () => {
+          try { await navigator.clipboard.writeText(code); toast('已複製'); } catch (e) { ta.focus(); ta.select(); toast('請手動全選複製'); }
+        } }, '複製'),
+        h('button', { class: 'btn primary', type: 'button', onclick: () => close(true) }, '完成')),
     ];
   });
 }
@@ -2696,6 +3147,7 @@ function enterApp(sess, d) {
   refreshFx();
   refreshPrices();
   loadHistory();
+  if (syncCfg()) runSync('unlock');
 }
 
 /* ---------- 設定 ---------- */
@@ -2731,7 +3183,7 @@ function openSettings() {
 
     return [
       h('h2', null, '設定'),
-      h('p', { class: 'lead' }, '資料只存在這個瀏覽器（已加密），不會上傳。換裝置請用「匯出備份」再到新裝置「匯入備份」。'),
+      h('p', { class: 'lead' }, '資料預設只存在這個瀏覽器（已加密）。想讓手機與電腦同步，請開啟下方「雲端同步」；也可以用「匯出備份／匯入備份」手動搬移。'),
       h('div', { class: 'row2' }, udCtl, themeCtl),
       h('div', { class: 'field', style: { marginTop: '12px' } }, h('label', { for: 'idle' }, '閒置自動鎖定'), idle),
       h('div', { class: 'sec' },
@@ -2751,6 +3203,7 @@ function openSettings() {
           h('button', { class: 'btn', type: 'button', onclick: () => fileIn.click() }, '匯入備份'),
           h('button', { class: 'btn', type: 'button', onclick: exportCsv }, '匯出 CSV'),
           fileIn)),
+      syncSection(),
       h('div', { class: 'sec' },
         h('h3', null, '安全'),
         h('div', { class: 'btnrow' },
@@ -2766,8 +3219,12 @@ function openSettings() {
   });
 }
 
-function exportBackup() {
-  const raw = Vault.exportBackup();
+async function exportBackup() {
+  // 備份檔不含雲端同步的 Token 與同步密碼
+  const snap = JSON.parse(JSON.stringify(data));
+  delete snap.sync;
+  let raw;
+  try { raw = await Vault.exportSealed(session, snap); } catch (e) { raw = null; }
   if (!raw) { toast('沒有可匯出的資料'); return; }
   download('crypto-ledger-backup-' + stampName() + '.json', raw, 'application/json');
   toast('已匯出加密備份（還原時需要現在的密碼）');
@@ -2795,6 +3252,12 @@ async function importBackup(file, closeSettings) {
     confirm: '匯入並覆蓋', danger: true,
   });
   if (!ok) return;
+  // 匯入視為「以備份為準」：與目前資料比對，被取代的交易留下刪除記錄，之後同步時才不會又冒出來
+  const st = SyncCore.stamp(data.txs, d.txs, data.deleted, Date.now());
+  d.txs = st.txs;
+  d.deleted = Object.assign({}, d.deleted, st.deleted);
+  d.mpAt = SyncCore.stampMp(data.manualPrices, Object.assign({}, d.mpAt, data.mpAt), d.manualPrices, Date.now());
+  d.sync = data.sync;
   data = d; touchData(); hist.version++;
   await persist();
   if (closeSettings) closeSettings(true);
@@ -2833,6 +3296,7 @@ function openChangePin() {
   ['pointerdown', 'keydown', 'touchstart', 'wheel'].forEach((ev) => window.addEventListener(ev, activity, { passive: true }));
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && session && (!market.updatedAt || Date.now() - market.updatedAt > 30000)) refreshPrices();
+    if (document.visibilityState === 'visible' && session && syncCfg() && Date.now() - syncSt.lastTry > 20000) runSync('visible');
   });
   showLock();
 })();
