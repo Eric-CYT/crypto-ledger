@@ -163,6 +163,14 @@ svg.chart, svg.alloc { display: block; width: 100%; height: auto; max-width: 100
 .chart .hit { fill: transparent; }
 .chart .hit:focus-visible { outline: none; stroke: var(--accent); stroke-width: 2; }
 .lg-box.cost { background: var(--cost-fill); border: 1px solid var(--cost-stroke); }
+.mini-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
+.mini { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px 6px; min-width: 0; }
+.mini-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 2px; flex-wrap: wrap; }
+.mini-head .asset { margin-right: auto; }
+.mini-val { font-weight: 650; }
+.mini-pnl { font-size: 12.5px; }
+.mini-body { min-height: 200px; }
+.mini-body.placeholder { display: flex; align-items: center; justify-content: center; color: var(--ink-2); font-size: 13px; }
 .p-good { color: var(--txt-green); }
 .p-bad { color: var(--txt-red); }
 .alloc .seg { transition: filter 0.12s; }
@@ -267,6 +275,7 @@ dialog.dlg::backdrop { background: rgba(0, 0, 0, 0.5); }
   .row2 { grid-template-columns: 1fr; }
 }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+.holdings tfoot td, table tfoot td{white-space:nowrap}
 
 </style>
 </head>
@@ -927,8 +936,11 @@ function tipRow(keyColor, label, value, strong) {
 function lineChart(container, pts, o) {
   clear(container);
   const cur = o.cur;
-  const W = Math.max(container.clientWidth || 640, 260), H = 280;
-  const m = { t: 16, r: 20, b: 30, l: cur === 'TWD' ? 60 : 56 };
+  const compact_ = !!o.compact;                 // 小圖：各幣種曲線用
+  const col = o.color || 'var(--c1)';           // 市值線顏色（各幣種沿用配置圖的顏色）
+  const nameTag = o.name ? o.name + '：' : '';
+  const W = Math.max(container.clientWidth || 640, 240), H = compact_ ? 200 : 280;
+  const m = compact_ ? { t: 14, r: 14, b: 26, l: cur === 'TWD' ? 56 : 50 } : { t: 16, r: 20, b: 30, l: cur === 'TWD' ? 60 : 56 };
   const iw = W - m.l - m.r, ih = H - m.t - m.b;
   const n = pts.length;
   const x0 = pts[0].ts, x1 = pts[n - 1].ts;
@@ -938,14 +950,14 @@ function lineChart(container, pts, o) {
   const pad = (hi - lo) * 0.08 || Math.abs(hi) * 0.05 || 1;
   lo = lo >= 0 ? Math.max(0, lo - pad) : lo - pad;
   hi = hi + pad;
-  const nt = niceTicks(lo, hi, 5);
+  const nt = niceTicks(lo, hi, compact_ ? 4 : 5);
 
   const X = (ts) => m.l + (x1 === x0 ? iw / 2 : ((ts - x0) / (x1 - x0)) * iw);
   const Y = (v) => m.t + ih - ((v - nt.min) / (nt.max - nt.min)) * ih;
 
   const svg = s('svg', {
     class: 'chart', viewBox: '0 0 ' + W + ' ' + H, width: W, height: H, role: 'img', tabindex: 0,
-    'aria-label': '資產淨值曲線：' + fmtDate(x0, true) + ' 至今，市值由 ' + fmtMoney(pts[0].value, cur) + ' 變為 ' +
+    'aria-label': nameTag + '資產淨值曲線：' + fmtDate(x0, true) + ' 至今，市值由 ' + fmtMoney(pts[0].value, cur) + ' 變為 ' +
       fmtMoney(pts[n - 1].value, cur) + '。可用左右方向鍵逐日瀏覽。',
   });
 
@@ -959,7 +971,7 @@ function lineChart(container, pts, o) {
   // X 軸刻度
   const long = x1 - x0 > 400 * 86400000;
   const seen = {};
-  const nx = Math.min(5, n);
+  const nx = Math.min(compact_ ? 3 : 5, n);
   for (let i = 0; i < nx; i++) {
     const idx = nx === 1 ? 0 : Math.round((i * (n - 1)) / (nx - 1));
     const d = fmtDate(pts[idx].ts, true);
@@ -973,16 +985,16 @@ function lineChart(container, pts, o) {
   // 折線：成本（背景）→ 市值（重點）
   const path = (key) => pts.map((p, i) => (i ? 'L' : 'M') + X(p.ts).toFixed(1) + ' ' + Y(p[key]).toFixed(1)).join('');
   svg.appendChild(s('path', { class: 'line', d: path('cost'), style: { stroke: 'var(--ink-3)' } }));
-  svg.appendChild(s('path', { class: 'line', d: path('value'), style: { stroke: 'var(--c1)' } }));
+  svg.appendChild(s('path', { class: 'line', d: path('value'), style: { stroke: col } }));
 
   // 終點標記與數值
   const last = pts[n - 1];
-  svg.appendChild(s('circle', { class: 'dot', cx: X(last.ts), cy: Y(last.value), r: 4, style: { fill: 'var(--c1)' } }));
+  svg.appendChild(s('circle', { class: 'dot', cx: X(last.ts), cy: Y(last.value), r: 4, style: { fill: col } }));
   svg.appendChild(s('text', { class: 'endlabel', x: X(last.ts), y: Y(last.value) - 10, 'text-anchor': 'end' }, fmtMoney(last.value, cur)));
 
   // hover 層
   const cross = s('line', { class: 'cross', y1: m.t, y2: m.t + ih, x1: 0, x2: 0, visibility: 'hidden' });
-  const hv = s('circle', { class: 'dot', r: 4, visibility: 'hidden', style: { fill: 'var(--c1)' } });
+  const hv = s('circle', { class: 'dot', r: 4, visibility: 'hidden', style: { fill: col } });
   const hc = s('circle', { class: 'dot', r: 4, visibility: 'hidden', style: { fill: 'var(--ink-3)' } });
   svg.appendChild(cross); svg.appendChild(hc); svg.appendChild(hv);
   const overlay = s('rect', { class: 'overlay', x: m.l, y: m.t, width: iw, height: ih });
@@ -1001,8 +1013,8 @@ function lineChart(container, pts, o) {
     const pnl = p.value - p.cost;
     const isNow = i === n - 1;
     Tip.show(cx, cy, [
-      h('div', { class: 'tip-head' }, isNow ? '現在　' + fmtDT(p.ts) : fmtDate(p.ts, true) + '（UTC 日收盤）'),
-      tipRow('var(--c1)', '市值', fmtMoney(p.value, cur), true),
+      h('div', { class: 'tip-head' }, (o.name ? o.name + '　' : '') + (isNow ? '現在　' + fmtDT(p.ts) : fmtDate(p.ts, true) + '（UTC 日收盤）')),
+      tipRow(col, '市值', fmtMoney(p.value, cur), true),
       tipRow('var(--ink-3)', '持倉成本', fmtMoney(p.cost, cur), true),
       tipRow(null, '未實現損益', fmtSigned(pnl, cur) + (p.cost > 0 ? '（' + fmtPct(pnl / p.cost, true) + '）' : ''), false),
     ]);
@@ -1038,9 +1050,9 @@ function lineChart(container, pts, o) {
   });
 
   const legend = h('div', { class: 'legend' },
-    h('span', { class: 'lg-item' }, h('span', { class: 'lg-line', style: { background: 'var(--c1)' } }), '市值'),
+    h('span', { class: 'lg-item' }, h('span', { class: 'lg-line', style: { background: col } }), '市值'),
     h('span', { class: 'lg-item' }, h('span', { class: 'lg-line', style: { background: 'var(--ink-3)' } }), '持倉成本'));
-  container.appendChild(legend);
+  if (!compact_) container.appendChild(legend);
   container.appendChild(svg);
 }
 
@@ -1407,9 +1419,9 @@ async function loadHistory() {
   const first = {};
   for (const t of data.txs) if (t.asset !== 'USDT' && (first[t.asset] == null || t.ts < first[t.asset])) first[t.asset] = t.ts;
   const todo = Object.keys(first).filter((a) => !hist.closes[a] || hist.closes[a].start > utcDayStart(first[a]));
-  if (!todo.length) { renderChart(); return; }
+  if (!todo.length) { renderChart(); renderAssetCurves(); return; }
   hist.status = 'loading';
-  renderChart();
+  renderChart(); renderAssetCurves();
   await Promise.all(todo.map(async (a) => {
     const start = utcDayStart(first[a]);
     try {
@@ -1419,7 +1431,7 @@ async function loadHistory() {
     } catch (e) { if (hist.failed.indexOf(a) < 0) hist.failed.push(a); }
   }));
   hist.status = 'ready'; hist.version++;
-  if (session) renderChart();
+  if (session) { renderChart(); renderAssetCurves(); }
 }
 
 /* ---------- 自動鎖定 / 計時器 ---------- */
@@ -1468,13 +1480,14 @@ function buildShell() {
   el.filters = h('div', { class: 'filters' });
   el.summary = h('section', { class: 'card', 'aria-label': '資產摘要' });
   el.chart = h('section', { class: 'card', 'aria-label': '資產淨值曲線' });
+  el.curves = h('section', { class: 'card', 'aria-label': '各幣種曲線' });
   el.bars = h('section', { class: 'card', 'aria-label': '各幣種成本與損益' });
   el.alloc = h('section', { class: 'card', 'aria-label': '資產配置' });
   el.holdings = h('section', { class: 'card', 'aria-label': '持倉' });
   el.tx = h('section', { class: 'card', 'aria-label': '交易紀錄' });
   $root.appendChild(h('div', { class: 'page' },
     h('div', { class: 'topbar' }, brand, el.status, tools),
-    el.notices, el.filters, el.summary, el.chart, el.bars, el.alloc, el.holdings, el.tx));
+    el.notices, el.filters, el.summary, el.chart, el.curves, el.bars, el.alloc, el.holdings, el.tx));
 }
 function logo() {
   const svg = s('svg', { viewBox: '0 0 24 24', width: 26, height: 26, 'aria-hidden': 'true' },
@@ -1488,11 +1501,11 @@ function renderAll() {
   applyUd();
   const empty = data.txs.length === 0;
   el.filters.hidden = empty;
-  el.chart.hidden = empty; el.bars.hidden = empty; el.alloc.hidden = empty; el.holdings.hidden = empty; el.tx.hidden = empty;
+  el.chart.hidden = empty; el.curves.hidden = empty; el.bars.hidden = empty; el.alloc.hidden = empty; el.holdings.hidden = empty; el.tx.hidden = empty;
   renderNotices(C);
   renderFilters();
   renderSummary(C);
-  if (!empty) { renderChart(); renderBars(C); renderAlloc(C); renderHoldings(C); }
+  if (!empty) { renderChart(); renderAssetCurves(C); renderBars(C); renderAlloc(C); renderHoldings(C); }
   renderTx(C);
   updateStatus();
 }
@@ -1504,7 +1517,7 @@ function renderLive() {
   el.tx.hidden = empty;
   renderNotices(C);
   renderSummary(C);
-  if (!empty) { renderChart(); renderBars(C); renderAlloc(C); renderHoldings(C); }
+  if (!empty) { renderChart(); renderAssetCurves(C); renderBars(C); renderAlloc(C); renderHoldings(C); }
   renderTx(C);
   updateStatus();
 }
@@ -1591,8 +1604,8 @@ function renderSummary(C) {
 }
 
 /* ---------- 淨值曲線 ---------- */
-function dayEnds() {
-  const first = Math.min.apply(null, data.txs.map((t) => t.ts));
+function dayEnds(txs) {
+  const first = Math.min.apply(null, (txs || data.txs).map((t) => t.ts));
   const now = Date.now();
   const out = [];
   for (let d = utcDayStart(first); d + DAY - 1 < now; d += DAY) out.push(d + DAY - 1);
@@ -1681,6 +1694,81 @@ function chartTable(pts, cur) {
     h('table', null,
       h('thead', null, h('tr', null, h('th', null, '日期'), h('th', null, '市值'), h('th', null, '持倉成本'), h('th', null, '未實現損益'))),
       h('tbody', null, rows)));
+}
+
+/* ---------- 各幣種曲線（小圖矩陣） ---------- */
+let assetSeriesCache = { key: null, map: {} };
+function sliceRange(pts) {
+  const range = RANGES.filter((r) => r[0] === data.settings.range)[0] || RANGES[4];
+  if (range[2] <= 0) return pts;
+  const cutoff = Date.now() - range[2] * DAY;
+  const sliced = pts.filter((p) => p.ts >= cutoff);
+  return sliced.length >= 2 ? sliced : pts.slice(-2);
+}
+function getAssetSeries(C, asset) {
+  const now = Date.now();
+  const key = [dataVersion, hist.version, C.cur, C.method, C.cur === 'TWD' ? C.fxNow.toFixed(4) : '', utcDayStart(now)].join('|');
+  if (assetSeriesCache.key !== key) assetSeriesCache = { key, map: {} };
+  const txs = data.txs.filter((t) => t.asset === asset);
+  if (!txs.length) return [];
+  if (!assetSeriesCache.map[asset]) {
+    const all = Engine.netWorthSeries(txs, seriesOpts(C, dayEnds(txs), now));
+    assetSeriesCache.map[asset] = all.slice(0, -1);
+  }
+  const nowPt = Engine.netWorthSeries(txs, seriesOpts(C, [], now)).pop();
+  return assetSeriesCache.map[asset].concat([nowPt]);
+}
+function renderAssetCurves(C) {
+  if (!data || !data.txs.length) return;
+  C = C || lastC || compute();
+  clear(el.curves);
+  const cur = C.cur;
+  const rows = C.summary.rows;
+  const range = RANGES.filter((r) => r[0] === data.settings.range)[0] || RANGES[4];
+  el.curves.appendChild(h('div', { class: 'card-head' },
+    h('h2', null, '各幣種曲線'),
+    h('span', { class: 'card-sub' }, '彩色線＝市值（顏色同資產配置）　灰線＝持倉成本　區間：' + range[1] + '　各圖縱軸獨立')));
+  if (!rows.length) { el.curves.appendChild(h('p', { class: 'muted' }, '目前沒有持倉。')); return; }
+  if (hist.status === 'loading' && !assetSeriesCache.key) {
+    el.curves.appendChild(h('div', { class: 'chart-body placeholder' }, '載入歷史價格中…'));
+    return;
+  }
+  const col = colorOf(assetOrder());
+  const grid = h('div', { class: 'mini-grid' + (hist.status === 'loading' ? ' is-loading' : '') });
+  const cells = rows.map((r) => {
+    const body = h('div', { class: 'mini-body' });
+    const pnlCls = signClass(r.unrealized);
+    const cell = h('div', { class: 'mini' },
+      h('div', { class: 'mini-head' },
+        h('span', { class: 'asset' }, h('span', { class: 'lg-box', style: { background: col(r.asset) || 'var(--c-other)' } }), r.asset),
+        h('span', { class: 'mini-val num' }, r.value != null ? fmtMoney(r.value, cur) : '—'),
+        r.unrealizedPct != null ? h('span', { class: 'mini-pnl num ' + pnlCls }, arrow(r.unrealized) + fmtPct(r.unrealizedPct, true)) : null),
+      body);
+    return { r, body, cell };
+  });
+  cells.forEach((c) => grid.appendChild(c.cell));
+  el.curves.appendChild(grid);              // 先掛上 DOM，才量得到寬度
+  cells.forEach((c) => {
+    const pts = sliceRange(getAssetSeries(C, c.r.asset));
+    if (pts.length < 2 || pts[pts.length - 1].ts === pts[0].ts) {
+      c.body.className = 'mini-body placeholder';
+      c.body.textContent = '資料點不足（需跨越至少一天）';
+      return;
+    }
+    lineChart(c.body, pts, { cur, compact: true, color: col(c.r.asset) || 'var(--c-other)', name: c.r.asset });
+  });
+  const notes = ['市值採用幣安每日（UTC）收盤價；持倉成本依你選的成本算法計算。'];
+  if (hist.failed.length) notes.push('無法取得 ' + hist.failed.join('、') + ' 的歷史價格，該幣以成交價估算。');
+  if (cur === 'TWD') notes.push('台幣曲線的市值以目前匯率換算。');
+  el.curves.appendChild(h('p', { class: 'foot' }, notes.join(' ')));
+  if (window.ResizeObserver) {
+    let lastW = grid.clientWidth;
+    grid._ro = new ResizeObserver(() => {
+      if (!grid.isConnected) { grid._ro.disconnect(); return; }
+      if (Math.abs(grid.clientWidth - lastW) > 8) { lastW = grid.clientWidth; renderAssetCurves(); }
+    });
+    grid._ro.observe(grid);
+  }
 }
 
 /* ---------- 各幣種：成本 / 盈虧 直條圖 ---------- */
@@ -1773,6 +1861,7 @@ function renderHoldings(C) {
         h('span', { class: 'lg-box', style: { background: c || 'var(--c-other)' } }), r.asset)),
       h('td', { 'data-label': '持有量' }, fmtQty(r.qty)),
       h('td', { 'data-label': '平均成本' }, fmtPrice(r.avgCost, cur)),
+      h('td', { 'data-label': '成本金額' }, r.cost != null ? fmtMoney(r.cost, cur) : '—'),
       priceCell,
       h('td', { 'data-label': '24h', class: signClass(r.pct) }, r.pct != null ? arrow(r.pct) + fmtPct(r.pct / 100, true) : '—'),
       h('td', { 'data-label': '市值' }, r.value != null ? fmtMoney(r.value, cur) : '—'),
@@ -1782,12 +1871,14 @@ function renderHoldings(C) {
       h('td', { 'data-label': '已實現', class: signClass(r.realized) }, fmtSigned(r.realized, cur)));
   });
   const tfoot = h('tfoot', null, h('tr', null,
-    h('td', { 'data-label': '合計' }, '合計'), h('td'), h('td'), h('td'), h('td'),
+    h('td', { 'data-label': '合計' }, '合計'), h('td'), h('td'),
+    h('td', { 'data-label': '成本金額' }, fmtMoney(S.rows.reduce((a, r) => a + r.cost, 0), cur)),
+    h('td'), h('td'),
     h('td', { 'data-label': '市值' }, fmtMoney(S.value, cur)), h('td'),
     h('td', { 'data-label': '未實現損益', class: signClass(S.unrealized) }, pnlText(S.unrealized, cur)),
     h('td', { 'data-label': '已實現（含已清倉）', class: signClass(S.realized) }, fmtSigned(S.realized, cur))));
   el.holdings.appendChild(h('div', { class: 'tablewrap' }, h('table', { class: 'rt' },
-    h('thead', null, h('tr', null, ['幣種', '持有量', '平均成本', '現價', '24h', '市值', '占比', '未實現損益', '已實現'].map((t) => h('th', null, t)))),
+    h('thead', null, h('tr', null, ['幣種', '持有量', '平均成本', '成本金額', '現價', '24h', '市值', '占比', '未實現損益', '已實現'].map((t) => h('th', null, t)))),
     h('tbody', null, rows), tfoot)));
 }
 
