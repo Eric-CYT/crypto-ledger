@@ -22,6 +22,7 @@
   --c-other: #a9a8a1;
   --txt-red: #d03b3b; --txt-green: #006300;
   --danger: #d03b3b; --st-good: #0ca30c; --st-warn: #fab219; --st-bad: #d03b3b;
+  --cost-fill: #ffffff; --cost-stroke: #8f8e88;
 }
 @media (prefers-color-scheme: dark) {
   :root:where(:not([data-theme="light"])) {
@@ -35,6 +36,7 @@
     --c5: #d55181; --c6: #008300; --c7: #9085e9; --c8: #e66767;
     --c-other: #5a5a56;
     --txt-red: #e66767; --txt-green: #0ca30c; --danger: #e66767;
+    --cost-fill: #ffffff; --cost-stroke: transparent;
   }
 }
 :root[data-theme="dark"] {
@@ -48,6 +50,7 @@
     --c5: #d55181; --c6: #008300; --c7: #9085e9; --c8: #e66767;
     --c-other: #5a5a56;
     --txt-red: #e66767; --txt-green: #0ca30c; --danger: #e66767;
+    --cost-fill: #ffffff; --cost-stroke: transparent;
 }
 
 :root[data-ud="red-up"] { --gain: var(--txt-red); --loss: var(--txt-green); }
@@ -133,6 +136,7 @@ button, input, select { font: inherit; color: inherit; }
 
 /* ---------- 圖表 ---------- */
 .chart-body { min-height: 296px; }
+.bars-body.chartmode { min-height: 344px; }
 .chart-body.placeholder { display: flex; align-items: center; justify-content: center; color: var(--ink-2); }
 .legend { display: flex; gap: 16px; font-size: 13px; margin-bottom: 6px; color: var(--ink-2); }
 .legend.wrap { flex-wrap: wrap; gap: 6px 16px; margin: 10px 0 0; }
@@ -149,6 +153,18 @@ svg.chart, svg.alloc { display: block; width: 100%; height: auto; max-width: 100
 .chart .endlabel { fill: var(--ink); font-size: 12px; font-weight: 600; paint-order: stroke; stroke: var(--surface); stroke-width: 3px; font-variant-numeric: tabular-nums; }
 .chart .cross { stroke: var(--axis); stroke-width: 1; }
 .chart .overlay { fill: transparent; touch-action: pan-y; cursor: crosshair; }
+.chart .bar.cost { fill: var(--cost-fill); stroke: var(--cost-stroke); stroke-width: 1; }
+.chart .bar.profit { fill: var(--st-good); }
+.chart .bar.loss { fill: var(--st-bad); }
+.chart .bargrp { transition: opacity 0.12s; }
+.chart .bargrp.hot { opacity: 0.78; }
+.chart .vlabel { fill: var(--ink); font-size: 11.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.chart .xlabel { fill: var(--ink-2); font-size: 12px; font-weight: 600; }
+.chart .hit { fill: transparent; }
+.chart .hit:focus-visible { outline: none; stroke: var(--accent); stroke-width: 2; }
+.lg-box.cost { background: var(--cost-fill); border: 1px solid var(--cost-stroke); }
+.p-good { color: var(--txt-green); }
+.p-bad { color: var(--txt-red); }
 .alloc .seg { transition: filter 0.12s; }
 .alloc .seg.hot { filter: brightness(1.12); }
 .alloc .hit { fill: transparent; }
@@ -537,6 +553,7 @@ const Engine = (function () {
       const q = priceOf(a);
       const row = {
         asset: a, qty: p.qty, cost: p.cost, avgCost: p.avgCost, realized: p.realized,
+        bought: p.boughtCost, sold: p.soldProceeds,
         price: q ? q.price : null, pct: q && q.pct != null ? q.pct : null, src: q ? q.src : null,
         value: null, unrealized: null, unrealizedPct: null,
       };
@@ -567,6 +584,34 @@ const Engine = (function () {
       dayChange,
       dayChangePct: value - dayChange > 0 ? dayChange / (value - dayChange) : null,
     };
+  }
+
+  /**
+   * 各幣種「成本 / 盈虧」直條資料（以現金流計算，與成本算法無關）。
+   *   尚未取回的成本 net = 累計買入（含手續費）− 累計賣出回收（已扣手續費）
+   *   net > 0：未回本
+   *     市值 ≥ net → white = net（成本），profit = 市值 − net
+   *     市值 <  net → white = 市值，loss = net − 市值
+   *   net ≤ 0：已取回全部成本 → 只留 profit = 目前市值（白色成本消失）
+   * pnl = 市值 − net = 已實現 + 未實現（總損益）。
+   */
+  function assetBars(rows) {
+    const out = [];
+    for (const r of rows) {
+      if (r.value == null) continue;
+      const net = r.bought - r.sold;
+      const recovered = net <= EPS * Math.max(1, r.bought);
+      let white = 0, profit = 0, loss = 0;
+      if (recovered) profit = r.value;
+      else if (r.value >= net) { white = net; profit = r.value - net; }
+      else { white = r.value; loss = net - r.value; }
+      out.push({
+        asset: r.asset, bought: r.bought, sold: r.sold, net, recovered, value: r.value,
+        white, profit, loss, height: white + profit + loss,
+        pnl: r.value - net, pct: r.bought > EPS ? (r.value - net) / r.bought : null,
+      });
+    }
+    return out.sort((a, b) => b.height - a.height);
   }
 
   /** 找到某幣種在 ts（含）之前最後一筆成交價；找不到回傳 null */
@@ -619,7 +664,7 @@ const Engine = (function () {
     return pts;
   }
 
-  return { EPS, sortTx, replay, summarize, netWorthSeries, lastTradePrice };
+  return { EPS, sortTx, replay, summarize, assetBars, netWorthSeries, lastTradePrice };
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports = Engine;
 
@@ -1060,6 +1105,95 @@ function allocBar(container, rows, o) {
   container.appendChild(legend);
 }
 
+/* ================= 各幣種：成本 / 盈虧 直條圖 ================= */
+function topRoundPath(x, y, w, h, r) {
+  r = Math.max(0, Math.min(r, h, w / 2));
+  return 'M' + x + ' ' + (y + h) + 'V' + (y + r) + 'Q' + x + ' ' + y + ' ' + (x + r) + ' ' + y +
+    'H' + (x + w - r) + 'Q' + (x + w) + ' ' + y + ' ' + (x + w) + ' ' + (y + r) + 'V' + (y + h) + 'Z';
+}
+function barLabel(b) {
+  if (b.recovered) return b.bought > Engine.EPS ? '已回本' : '零成本';
+  return fmtPct(b.pct, true);
+}
+function assetBarChart(container, allBars, o) {
+  clear(container);
+  const cur = o.cur;
+  const pct = o.mode === 'pct';               // pct：每根以「累計買入」為 100%，方便比較不同大小的幣種
+  const bars = pct ? allBars.filter((b) => b.bought > Engine.EPS) : allBars;
+  const K = (b) => (pct ? 1 / b.bought : 1);
+  const n = bars.length;
+  if (!n) { container.appendChild(h('p', { class: 'muted' }, '沒有可用「報酬率」表示的幣種（零成本幣種請切回金額檢視）。')); return; }
+  const W = Math.max(container.clientWidth || 600, 260), H = 300;
+  const m = { t: 30, r: 12, b: 32, l: pct ? 52 : (cur === 'TWD' ? 60 : 56) };
+  const iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const maxH = Math.max.apply(null, bars.map((b) => b.height * K(b)));
+  const nt = niceTicks(0, maxH > 0 ? maxH : 1, 5);
+  const Y = (v) => m.t + ih - (v / nt.max) * ih;
+  const slot = iw / n, bw = Math.min(40, slot * 0.6);
+  const showLabels = slot >= 54;
+  const tickText = (v) => (pct ? num(v * 100, 0, 0) + '%' : compact(v, cur));
+
+  const svg = s('svg', { class: 'chart', viewBox: '0 0 ' + W + ' ' + H, width: W, height: H, role: 'group', 'aria-label': '各幣種成本與盈虧直條圖' });
+  nt.ticks.forEach((v, i) => {
+    const y = Y(v);
+    svg.appendChild(s('line', { class: i === 0 ? 'axis' : 'grid', x1: m.l, x2: W - m.r, y1: y, y2: y }));
+    svg.appendChild(s('text', { class: 'tick', x: m.l - 8, y: y + 4, 'text-anchor': 'end' }, tickText(v)));
+  });
+
+  bars.forEach((b, i) => {
+    const k = K(b);
+    const cx = m.l + slot * (i + 0.5), x = cx - bw / 2;
+    const segs = [];
+    if (b.white > 0) segs.push({ kind: 'cost', v: b.white * k });
+    if (b.profit > 0) segs.push({ kind: 'profit', v: b.profit * k });
+    if (b.loss > 0) segs.push({ kind: 'loss', v: b.loss * k });
+    const g = s('g', { class: 'bargrp' });
+    let cursor = Y(0);
+    segs.forEach((sg, j) => {
+      const hpx = Math.max(2, (sg.v / nt.max) * ih);
+      const top = cursor - hpx;
+      const isTop = j === segs.length - 1;
+      const y = top + (isTop ? 0 : 1);
+      const hh = Math.max(1, hpx - (isTop ? 0 : 1) - (j > 0 ? 1 : 0));
+      g.appendChild(s('path', { class: 'bar ' + sg.kind, d: isTop ? topRoundPath(x, y, bw, hh, 4) : 'M' + x + ' ' + y + 'h' + bw + 'v' + hh + 'h' + (-bw) + 'Z' }));
+      cursor = top;
+    });
+    svg.appendChild(g);
+    if (showLabels) svg.appendChild(s('text', { class: 'vlabel', x: cx, y: cursor - 7, 'text-anchor': 'middle' }, barLabel(b)));
+    svg.appendChild(s('text', { class: 'xlabel', x: cx, y: H - 10, 'text-anchor': 'middle' }, b.asset));
+
+    const hit = s('rect', {
+      class: 'hit', x: m.l + slot * i, y: 0, width: slot, height: H - 20, tabindex: 0, role: 'img',
+      'aria-label': b.asset + '：' + (b.recovered ? '已回本，' : '') + '目前市值 ' + fmtMoney(b.value, cur) + '，總損益 ' + fmtSigned(b.pnl, cur),
+    });
+    const show = (cx2, cy2) => {
+      g.classList.add('hot');
+      const rows = [h('div', { class: 'tip-head' }, b.asset + (b.recovered ? '　已取回成本' : ''))];
+      rows.push(tipRow(null, '累計買入', fmtMoney(b.bought, cur), false));
+      if (b.sold > 0) rows.push(tipRow(null, '已賣出回收', fmtMoney(b.sold, cur), false));
+      if (b.white > 0 && !b.recovered) rows.push(tipRow('var(--cost-fill)', b.loss > 0 ? '剩餘市值（成本部分）' : '尚未取回成本', fmtMoney(b.white, cur), false));
+      rows.push(tipRow(null, '目前市值', fmtMoney(b.value, cur), true));
+      rows.push(tipRow(b.pnl >= 0 ? 'var(--st-good)' : 'var(--st-bad)', b.pnl >= 0 ? '盈利' : '虧損',
+        fmtSigned(b.pnl, cur) + (b.pct != null ? '（' + fmtPct(b.pct, true) + '）' : ''), true));
+      Tip.show(cx2, cy2, rows);
+    };
+    const hide = () => { g.classList.remove('hot'); Tip.hide(); };
+    hit.addEventListener('pointermove', (e) => show(e.clientX, e.clientY));
+    hit.addEventListener('pointerdown', (e) => show(e.clientX, e.clientY));
+    hit.addEventListener('pointerleave', hide);
+    hit.addEventListener('focus', () => { const r = hit.getBoundingClientRect(); show(r.left + r.width / 2, r.top + 40); });
+    hit.addEventListener('blur', hide);
+    svg.appendChild(hit);
+  });
+
+  const legend = h('div', { class: 'legend wrap' },
+    h('span', { class: 'lg-item' }, h('span', { class: 'lg-box cost' }), '尚未取回的成本'),
+    h('span', { class: 'lg-item' }, h('span', { class: 'lg-box', style: { background: 'var(--st-good)' } }), '盈利'),
+    h('span', { class: 'lg-item' }, h('span', { class: 'lg-box', style: { background: 'var(--st-bad)' } }), '虧損'));
+  container.appendChild(legend);
+  container.appendChild(svg);
+}
+
 /* ===== app-core.js ===== */
 /* ------------------------------------------------------------------
  * App core：狀態、儲存、對話框、行情更新、計算
@@ -1073,7 +1207,7 @@ let session = null;      // { key, salt, iter }
 let data = null;         // 解密後的資料（只在解鎖期間存在於記憶體）
 let market = { prices: {}, unknown: [], status: 'idle', error: null, updatedAt: null, busy: false, fx: null, fxError: null };
 let hist = { closes: {}, status: 'idle', failed: [], version: 0 };
-let uiState = { txAsset: '', txType: '', chartTable: false };
+let uiState = { txAsset: '', txType: '', chartTable: false, barsTable: false, barsMode: 'amount' };
 let dataVersion = 0;
 let seriesCache = { key: null, pts: null };
 let timers = { refresh: null, fx: null, idle: null };
@@ -1307,7 +1441,7 @@ function lockNow() {
   market = { prices: {}, unknown: [], status: 'idle', error: null, updatedAt: null, busy: false, fx: null, fxError: null };
   hist = { closes: {}, status: 'idle', failed: [], version: 0 };
   seriesCache = { key: null, pts: null };
-  uiState = { txAsset: '', txType: '', chartTable: false };
+  uiState = { txAsset: '', txType: '', chartTable: false, barsTable: false, barsMode: 'amount' };
   Tip.hide();
   document.querySelectorAll('dialog').forEach((d) => { try { d.close(); } catch (e) { /* ignore */ } d.remove(); });
   showLock();
@@ -1334,12 +1468,13 @@ function buildShell() {
   el.filters = h('div', { class: 'filters' });
   el.summary = h('section', { class: 'card', 'aria-label': '資產摘要' });
   el.chart = h('section', { class: 'card', 'aria-label': '資產淨值曲線' });
+  el.bars = h('section', { class: 'card', 'aria-label': '各幣種成本與損益' });
   el.alloc = h('section', { class: 'card', 'aria-label': '資產配置' });
   el.holdings = h('section', { class: 'card', 'aria-label': '持倉' });
   el.tx = h('section', { class: 'card', 'aria-label': '交易紀錄' });
   $root.appendChild(h('div', { class: 'page' },
     h('div', { class: 'topbar' }, brand, el.status, tools),
-    el.notices, el.filters, el.summary, el.chart, el.alloc, el.holdings, el.tx));
+    el.notices, el.filters, el.summary, el.chart, el.bars, el.alloc, el.holdings, el.tx));
 }
 function logo() {
   const svg = s('svg', { viewBox: '0 0 24 24', width: 26, height: 26, 'aria-hidden': 'true' },
@@ -1353,11 +1488,11 @@ function renderAll() {
   applyUd();
   const empty = data.txs.length === 0;
   el.filters.hidden = empty;
-  el.chart.hidden = empty; el.alloc.hidden = empty; el.holdings.hidden = empty; el.tx.hidden = empty;
+  el.chart.hidden = empty; el.bars.hidden = empty; el.alloc.hidden = empty; el.holdings.hidden = empty; el.tx.hidden = empty;
   renderNotices(C);
   renderFilters();
   renderSummary(C);
-  if (!empty) { renderChart(); renderAlloc(C); renderHoldings(C); }
+  if (!empty) { renderChart(); renderBars(C); renderAlloc(C); renderHoldings(C); }
   renderTx(C);
   updateStatus();
 }
@@ -1369,7 +1504,7 @@ function renderLive() {
   el.tx.hidden = empty;
   renderNotices(C);
   renderSummary(C);
-  if (!empty) { renderChart(); renderAlloc(C); renderHoldings(C); }
+  if (!empty) { renderChart(); renderBars(C); renderAlloc(C); renderHoldings(C); }
   renderTx(C);
   updateStatus();
 }
@@ -1524,6 +1659,7 @@ function renderChart() {
     if (!body._ro && window.ResizeObserver) {
       let lastW = body.clientWidth;
       body._ro = new ResizeObserver(() => {
+        if (!body.isConnected) { body._ro.disconnect(); return; }
         if (Math.abs(body.clientWidth - lastW) > 8 && !uiState.chartTable) { lastW = body.clientWidth; renderChart(); }
       });
       body._ro.observe(body);
@@ -1545,6 +1681,58 @@ function chartTable(pts, cur) {
     h('table', null,
       h('thead', null, h('tr', null, h('th', null, '日期'), h('th', null, '市值'), h('th', null, '持倉成本'), h('th', null, '未實現損益'))),
       h('tbody', null, rows)));
+}
+
+/* ---------- 各幣種：成本 / 盈虧 直條圖 ---------- */
+function renderBars(C) {
+  if (!data || !data.txs.length) return;
+  C = C || lastC || compute();
+  clear(el.bars);
+  const cur = C.cur;
+  const bars = Engine.assetBars(C.summary.rows);
+  const modeCtl = h('div', { class: 'segctl', role: 'radiogroup', 'aria-label': '直條單位' },
+    [['amount', '金額'], ['pct', '報酬率 %']].map((o) => h('button', { type: 'button', role: 'radio', 'aria-checked': String(uiState.barsMode === o[0]),
+      onclick: () => { uiState.barsMode = o[0]; renderBars(); } }, o[1])));
+  el.bars.appendChild(h('div', { class: 'card-head' },
+    h('h2', null, '各幣種成本與損益'),
+    bars.length && !uiState.barsTable ? modeCtl : null,
+    bars.length ? h('button', { class: 'btn small', type: 'button', 'aria-pressed': String(uiState.barsTable),
+      onclick: () => { uiState.barsTable = !uiState.barsTable; renderBars(); } }, uiState.barsTable ? '顯示圖表' : '表格檢視') : null));
+  if (!bars.length) { el.bars.appendChild(h('p', { class: 'muted' }, '目前沒有可估值的持倉。')); return; }
+  const body = h('div', { class: 'bars-body' + (uiState.barsTable ? '' : ' chartmode') });
+  el.bars.appendChild(body);
+  if (uiState.barsTable) body.appendChild(barsTable(bars, cur));
+  else {
+    assetBarChart(body, bars, { cur, mode: uiState.barsMode });
+    if (window.ResizeObserver) {
+      let lastW = body.clientWidth;
+      body._ro = new ResizeObserver(() => {
+        if (!body.isConnected) { body._ro.disconnect(); return; } // 被重繪移除後不再回應
+        if (Math.abs(body.clientWidth - lastW) > 8 && !uiState.barsTable) { lastW = body.clientWidth; renderBars(); }
+      });
+      body._ro.observe(body);
+    }
+  }
+  const notes = ['尚未取回的成本 = 累計買入（含手續費）− 已賣出回收；回收金額超過成本後，白色消失，只留綠色（高度 = 目前市值）。',
+    '色塊是該幣種的總損益（已實現 + 未實現），與成本算法無關。'];
+  if (uiState.barsMode === 'pct' && !uiState.barsTable) notes.push('「報酬率 %」模式下，每根以該幣種累計買入為 100%。');
+  if (C.summary.missing.length) notes.push(C.summary.missing.join('、') + ' 沒有任何價格，未列入。');
+  el.bars.appendChild(h('p', { class: 'foot' }, notes.join(' ')));
+}
+function barsTable(bars, cur) {
+  const good = (v) => (v >= 0 ? 'p-good' : 'p-bad');
+  const rows = bars.map((b) => h('tr', null,
+    h('td', { 'data-label': '幣種' }, h('strong', null, b.asset)),
+    h('td', { 'data-label': '累計買入' }, fmtMoney(b.bought, cur)),
+    h('td', { 'data-label': '已賣出回收' }, b.sold > 0 ? fmtMoney(b.sold, cur) : '—'),
+    h('td', { 'data-label': '尚未取回成本' }, b.recovered ? '0（已回本）' : fmtMoney(b.net, cur)),
+    h('td', { 'data-label': '目前市值' }, fmtMoney(b.value, cur)),
+    h('td', { 'data-label': '總損益', class: good(b.pnl) }, (b.pnl >= 0 ? '▲ ' : '▼ ') + fmtSigned(b.pnl, cur)),
+    h('td', { 'data-label': '報酬率', class: good(b.pnl) }, b.pct != null ? fmtPct(b.pct, true) : '—'),
+    h('td', { 'data-label': '狀態' }, b.recovered ? '已回本（僅綠色）' : b.pnl >= 0 ? '盈利中' : '虧損中')));
+  return h('div', { class: 'tablewrap' }, h('table', { class: 'rt' },
+    h('thead', null, h('tr', null, ['幣種', '累計買入', '已賣出回收', '尚未取回成本', '目前市值', '總損益', '報酬率', '狀態'].map((t) => h('th', null, t)))),
+    h('tbody', null, rows)));
 }
 
 /* ---------- 資產配置 ---------- */
