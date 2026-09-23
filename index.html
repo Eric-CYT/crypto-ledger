@@ -317,6 +317,15 @@ dialog.dlg::backdrop { background: rgba(0, 0, 0, 0.5); }
 .howto ol { margin: 8px 0 0 18px; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .codebox { width: 100%; font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; border: 1px solid var(--axis); border-radius: 8px; padding: 8px; background: var(--surface); color: var(--ink); }
 
+/* ---------- 帳本切換 ---------- */
+.prof-switch { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; margin: 4px 0 2px; }
+.prof-chip { border: 1px solid var(--border); background: var(--surface); color: var(--ink-2); border-radius: 999px; padding: 4px 14px; font-size: 13px; cursor: pointer; }
+.prof-chip:hover { background: var(--hover); }
+.prof-chip[aria-checked="true"] { background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 600; }
+.proflist { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.profrow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; }
+.profrow .pname { font-weight: 600; margin-right: auto; }
+
 </style>
 </head>
 <body>
@@ -489,6 +498,54 @@ function csvCell(v) {
   if (/[",\n\r]/.test(t)) t = '"' + t.replace(/"/g, '""') + '"';
   return t;
 }
+
+/* ------------------------------------------------------------------
+ * 帳本清單（多帳本切換）：只存名稱與 id，不含任何交易資料，
+ * 每個帳本實際的加密資料仍各自獨立存在 Vault 裡（見 vault.js）。
+ * ------------------------------------------------------------------ */
+const Profiles = (function () {
+  const K = 'cryptoledger.profiles.v1';
+  function raw() {
+    try {
+      const j = JSON.parse(window.localStorage.getItem(K));
+      if (j && Array.isArray(j.list) && j.list.length) return j;
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+  function save(o) { try { window.localStorage.setItem(K, JSON.stringify(o)); } catch (e) { /* ignore */ } }
+  /** 第一次使用（或舊版沒有帳本清單）時，自動補上一個對應舊資料位置的預設帳本 */
+  function ensure() {
+    let o = raw();
+    if (!o) { o = { list: [{ id: 'default', name: '主帳本', createdAt: Date.now() }], current: 'default' }; save(o); }
+    if (!o.list.some((p) => p.id === o.current)) o.current = o.list[0].id;
+    return o;
+  }
+  function list() { return ensure().list; }
+  function current() { return ensure().current; }
+  function setCurrent(id) { const o = ensure(); if (o.list.some((p) => p.id === id)) { o.current = id; save(o); } }
+  function add(name) {
+    const o = ensure();
+    const id = 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    o.list.push({ id, name: name.slice(0, 30), createdAt: Date.now() });
+    save(o);
+    return id;
+  }
+  function rename(id, name) {
+    const o = ensure();
+    const p = o.list.filter((x) => x.id === id)[0];
+    if (p) { p.name = name.slice(0, 30); save(o); }
+  }
+  /** 從清單移除（不含 Vault 資料本身，呼叫端要另外 Vault.reset(id)）；至少留一個帳本 */
+  function remove(id) {
+    const o = ensure();
+    if (o.list.length <= 1) return false;
+    o.list = o.list.filter((x) => x.id !== id);
+    if (o.current === id) o.current = o.list[0].id;
+    save(o);
+    return true;
+  }
+  return { list, current, setCurrent, add, rename, remove };
+})();
 
 /* ===== engine.js ===== */
 /* ------------------------------------------------------------------
@@ -847,8 +904,10 @@ if (typeof module !== 'undefined' && module.exports) module.exports = SyncCore;
  * 資料只存在這台裝置的瀏覽器裡，不會上傳到 GitHub 或任何伺服器。
  * ------------------------------------------------------------------ */
 const Vault = (function () {
-  const K_DATA = 'cryptoledger.vault.v1';
-  const K_META = 'cryptoledger.meta.v1';
+  // 多帳本：'default' 沿用舊版沒有帳本切換功能時的 key（不用搬資料，舊使用者自動相容）；
+  // 其他帳本用各自的 id 加上後綴，彼此完全獨立的 localStorage 空間。
+  function keyData(id) { return id === 'default' ? 'cryptoledger.vault.v1' : 'cryptoledger.vault.' + id + '.v1'; }
+  function keyMeta(id) { return id === 'default' ? 'cryptoledger.meta.v1' : 'cryptoledger.meta.' + id + '.v1'; }
   const ITER = 250000;
   const enc = new TextEncoder();
   const dec = new TextDecoder();
@@ -906,31 +965,34 @@ const Vault = (function () {
     return { session: { key, salt, iter }, data: JSON.parse(dec.decode(plain)) };
   }
 
-  function has() { return !!get(K_DATA); }
+  function has(id) { return !!get(keyData(id)); }
 
-  async function create(pin, data) {
+  async function create(id, pin, data) {
     const salt = crypto.getRandomValues(new Uint8Array(16));
-    const session = { key: await deriveKey(pin, salt, ITER), salt, iter: ITER };
-    set(K_DATA, JSON.stringify(await seal(session, data)));
+    const session = { id, key: await deriveKey(pin, salt, ITER), salt, iter: ITER };
+    set(keyData(id), JSON.stringify(await seal(session, data)));
     return session;
   }
 
+  /** session 本身帶著 id（哪個帳本），存回原本那個帳本的位置 */
   async function save(session, data) {
-    set(K_DATA, JSON.stringify(await seal(session, data)));
+    set(keyData(session.id), JSON.stringify(await seal(session, data)));
   }
 
-  async function unlock(pin) {
-    const raw = get(K_DATA);
+  async function unlock(id, pin) {
+    const raw = get(keyData(id));
     if (!raw) throw new Error('NO_VAULT');
-    return openEnvelope(JSON.parse(raw), pin);
+    const r = await openEnvelope(JSON.parse(raw), pin);
+    r.session.id = id;
+    return r;
   }
 
-  /** 換密碼：以新 PIN 與新 salt 重新加密同一份資料 */
-  async function rekey(newPin, data) {
-    return create(newPin, data);
+  /** 換密碼：以新 PIN 與新 salt 重新加密同一份資料（同一個帳本） */
+  async function rekey(id, newPin, data) {
+    return create(id, newPin, data);
   }
 
-  function exportBackup() { return get(K_DATA); }
+  function exportBackup(id) { return get(keyData(id)); }
   /** 以目前 session 的金鑰把指定資料封成備份（用來匯出「不含同步 Token」的備份） */
   async function exportSealed(session, data) { return JSON.stringify(await seal(session, data)); }
 
@@ -959,24 +1021,25 @@ const Vault = (function () {
     return r.data;
   }
 
-  function reset() { del(K_DATA); del(K_META); }
+  /** 只清這個帳本的保險庫（不影響其他帳本） */
+  function reset(id) { del(keyData(id)); del(keyMeta(id)); }
 
-  /* ---- 嘗試次數與鎖定（僅為前端層級的減速帶） ---- */
-  function meta() {
-    try { return JSON.parse(get(K_META)) || { fails: 0, until: 0 }; } catch (e) { return { fails: 0, until: 0 }; }
+  /* ---- 嘗試次數與鎖定（僅為前端層級的減速帶；每個帳本各自計算） ---- */
+  function meta(id) {
+    try { return JSON.parse(get(keyMeta(id))) || { fails: 0, until: 0 }; } catch (e) { return { fails: 0, until: 0 }; }
   }
-  function lockRemainingMs() { return Math.max(0, meta().until - Date.now()); }
-  function recordFail() {
-    const m = meta();
+  function lockRemainingMs(id) { return Math.max(0, meta(id).until - Date.now()); }
+  function recordFail(id) {
+    const m = meta(id);
     m.fails = (m.fails || 0) + 1;
     if (m.fails % 5 === 0) {
       const level = Math.floor(m.fails / 5) - 1;
       m.until = Date.now() + Math.min(30 * Math.pow(2, level), 3600) * 1000;
     }
-    try { set(K_META, JSON.stringify(m)); } catch (e) { /* ignore */ }
+    try { set(keyMeta(id), JSON.stringify(m)); } catch (e) { /* ignore */ }
     return { fails: m.fails, remainingTries: 5 - (m.fails % 5), lockedMs: Math.max(0, m.until - Date.now()) };
   }
-  function clearFails() { del(K_META); }
+  function clearFails(id) { del(keyMeta(id)); }
 
   return { supported, has, create, save, unlock, rekey, exportBackup, exportSealed, newSession, sealWith, openAny, readBackup, reset, lockRemainingMs, recordFail, clearFails };
 })();
@@ -3000,6 +3063,9 @@ function detachLockKeys() {
   if (lockKeyHandler) { document.removeEventListener('keydown', lockKeyHandler); lockKeyHandler = null; }
 }
 
+let activeProfile = null;   // 鎖定畫面目前選到的帳本 id；null 時用上次使用的那個
+function profileName(id) { const p = Profiles.list().filter((x) => x.id === id)[0]; return p ? p.name : '帳本'; }
+
 function showLock() {
   detachLockKeys();
   stopTimers();
@@ -3010,7 +3076,9 @@ function showLock() {
       h('p', { class: 'lock-sub' }, '這個瀏覽器不支援加密功能或禁止儲存資料。請改用 https 網址（例如 GitHub Pages）並關閉無痕模式後再試。'))));
     return;
   }
-  const isSetup = !Vault.has();
+  const profiles = Profiles.list();
+  if (!activeProfile || !profiles.some((p) => p.id === activeProfile)) activeProfile = Profiles.current();
+  const isSetup = !Vault.has(activeProfile);
   let entry = '', first = null, busy = false, countdown = null;
 
   const dots = [0, 1, 2, 3].map(() => h('span', { class: 'pin-dot' }));
@@ -3024,14 +3092,16 @@ function showLock() {
     dots.forEach((d, i) => d.classList.toggle('on', i < entry.length));
     dotsEl.setAttribute('aria-label', 'PIN 已輸入 ' + entry.length + ' 位');
   };
+  const profLabel = profiles.length > 1 ? '「' + profileName(activeProfile) + '」' : '';
   const paintSub = () => {
-    sub.textContent = isSetup ? (first === null ? '首次使用：請設定 4 位數密碼' : '請再輸入一次以確認') : '請輸入 4 位數密碼';
+    sub.textContent = isSetup ? (first === null ? '首次使用：請設定 ' + profLabel + ' 的 4 位數密碼' : '請再輸入一次以確認')
+      : profLabel ? '請輸入 ' + profLabel + ' 的 4 位數密碼' : '請輸入 4 位數密碼';
   };
   const setDisabled = (v) => keys.forEach((k) => { k.disabled = v; });
   const shake = () => { dotsEl.classList.remove('shake'); void dotsEl.offsetWidth; dotsEl.classList.add('shake'); };
 
   function checkLockout() {
-    const ms = Vault.lockRemainingMs();
+    const ms = Vault.lockRemainingMs(activeProfile);
     if (ms > 0) {
       setDisabled(true);
       setMsg('嘗試次數過多，請等待 ' + Math.ceil(ms / 1000) + ' 秒後再試。', 'err');
@@ -3055,20 +3125,20 @@ function showLock() {
         } else {
           setMsg('建立加密資料中…');
           const d = defaultData();
-          const sess = await Vault.create(pin, d);
+          const sess = await Vault.create(activeProfile, pin, d);
           finish(sess, d);
           return;
         }
       } else {
         setMsg('驗證中…');
         try {
-          const r = await Vault.unlock(pin);
+          const r = await Vault.unlock(activeProfile, pin);
           finish(r.session, r.data);
           return;
         } catch (e) {
           entry = ''; paint(); shake();
           if (e.message === 'BAD_PIN') {
-            const f = Vault.recordFail();
+            const f = Vault.recordFail(activeProfile);
             setMsg(f.lockedMs > 0 ? '密碼錯誤次數過多，暫時鎖定。' : '密碼錯誤（再錯 ' + f.remainingTries + ' 次會暫時鎖定）', 'err');
           } else setMsg('讀取資料失敗：資料格式異常。', 'err');
         }
@@ -3082,7 +3152,7 @@ function showLock() {
   }
 
   function press(d) {
-    if (busy || Vault.lockRemainingMs() > 0) return;
+    if (busy || Vault.lockRemainingMs(activeProfile) > 0) return;
     if (entry.length >= 4) return;
     entry += d; paint();
     if (entry.length === 4) submit();
@@ -3091,7 +3161,8 @@ function showLock() {
   function finish(sess, d) {
     if (countdown) clearInterval(countdown);
     detachLockKeys();
-    Vault.clearFails();
+    Profiles.setCurrent(activeProfile);
+    Vault.clearFails(activeProfile);
     enterApp(sess, d);
   }
 
@@ -3122,11 +3193,19 @@ function showLock() {
         body: '忘記密碼無法復原資料。清除後，這個瀏覽器裡的所有交易紀錄都會永久刪除；若你有匯出過備份檔，之後可以還原（需要備份時的密碼）。',
         confirm: '清除並重新設定', danger: true,
       });
-      if (ok) { Vault.reset(); showLock(); }
+      if (ok) { Vault.reset(activeProfile); showLock(); }
     } }, '忘記密碼？');
 
+  const switcher = profiles.length > 1
+    ? h('div', { class: 'prof-switch', role: 'radiogroup', 'aria-label': '選擇帳本' },
+      profiles.map((p) => h('button', {
+        type: 'button', role: 'radio', 'aria-checked': String(p.id === activeProfile), class: 'prof-chip',
+        onclick: () => { if (p.id === activeProfile) return; activeProfile = p.id; Profiles.setCurrent(p.id); showLock(); },
+      }, p.name)))
+    : null;
+
   $root.appendChild(h('div', { class: 'lock' }, h('div', { class: 'lock-card' },
-    logoLarge(), h('h1', null, '加密貨幣帳本'), sub, dotsEl, msg, pad, foot)));
+    logoLarge(), h('h1', null, '加密貨幣帳本'), switcher, sub, dotsEl, msg, pad, foot)));
   paint(); paintSub(); checkLockout();
 }
 function logoLarge() {
@@ -3148,6 +3227,76 @@ function enterApp(sess, d) {
   refreshPrices();
   loadHistory();
   if (syncCfg()) runSync('unlock');
+}
+
+/* ---------- 帳本（多帳本切換） ---------- */
+function addProfileDialog() {
+  return modal((close) => {
+    const inp = h('input', { type: 'text', id: 'pf-name', placeholder: '例如：家人帳戶、選擇權帳戶', autocomplete: 'off', maxlength: 30 });
+    const err = h('div', { class: 'err', role: 'alert' });
+    const save = () => {
+      const name = inp.value.trim();
+      if (!name) { err.textContent = '請輸入帳本名稱。'; return; }
+      close(name);
+    };
+    inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); save(); } });
+    return [
+      h('h2', null, '新增帳本'),
+      h('p', { class: 'lead' }, '會建立一個全新、獨立的帳本：自己的密碼、交易紀錄，跟目前這個帳本互不相通（也可以各自開自己的雲端同步）。'),
+      h('div', { class: 'field' }, h('label', { for: 'pf-name' }, '帳本名稱'), inp), err,
+      h('div', { class: 'dlg-actions' },
+        h('button', { class: 'btn', type: 'button', onclick: () => close(null) }, '取消'),
+        h('button', { class: 'btn primary', type: 'button', onclick: save }, '建立')),
+    ];
+  });
+}
+function profileSection(closeSettings) {
+  const box = h('div', { class: 'sec' });
+  const rnErr = h('div', { class: 'err', role: 'alert' });
+  const paint = () => {
+    clear(box);
+    const profiles = Profiles.list();
+    const me = profiles.filter((p) => p.id === session.id)[0];
+    const others = profiles.filter((p) => p.id !== session.id);
+    const nameIn = h('input', { type: 'text', id: 'pf-rename', value: me ? me.name : '', maxlength: 30, autocomplete: 'off' });
+    box.appendChild(h('h3', null, '帳本'));
+    box.appendChild(h('p', { class: 'hint muted' }, '每個帳本有自己的密碼與交易紀錄，彼此完全獨立；想同時記錄不同用途的資料（例如自己的與家人的），可以建立多個帳本。'));
+    box.appendChild(h('div', { class: 'field' }, h('label', { for: 'pf-rename' }, '目前帳本名稱'),
+      h('div', { class: 'inline' }, nameIn,
+        h('button', { class: 'btn', type: 'button', onclick: () => {
+          const name = nameIn.value.trim();
+          if (!name) { rnErr.textContent = '名稱不能是空的。'; return; }
+          Profiles.rename(session.id, name); rnErr.textContent = ''; toast('已更新名稱'); paint();
+        } }, '更新名稱'))));
+    box.appendChild(rnErr);
+    if (others.length) {
+      box.appendChild(h('div', { class: 'proflist' }, others.map((p) => h('div', { class: 'profrow' },
+        h('span', { class: 'pname' }, p.name),
+        h('button', { class: 'btn small', type: 'button', onclick: () => {
+          activeProfile = p.id; Profiles.setCurrent(p.id);
+          closeSettings(true); lockNow();
+        } }, '切換到這個帳本'),
+        h('button', { class: 'btn small danger', type: 'button', onclick: async () => {
+          const ok = await confirmDialog({
+            title: '刪除「' + p.name + '」？',
+            body: '這會永久刪除這個帳本的密碼與所有交易紀錄，無法復原（不影響目前這個帳本）。若有雲端同步，雲端上的資料不會被刪除。',
+            confirm: '刪除帳本', danger: true,
+          });
+          if (!ok) return;
+          Vault.reset(p.id); Profiles.remove(p.id); toast('已刪除「' + p.name + '」'); paint();
+        } }, '刪除')))));
+    }
+    box.appendChild(h('div', { class: 'btnrow', style: { marginTop: '10px' } },
+      h('button', { class: 'btn', type: 'button', onclick: async () => {
+        const name = await addProfileDialog();
+        if (!name) return;
+        const id = Profiles.add(name);
+        activeProfile = id; Profiles.setCurrent(id);
+        closeSettings(true); lockNow();
+      } }, '新增帳本')));
+  };
+  paint();
+  return box;
 }
 
 /* ---------- 設定 ---------- */
@@ -3184,6 +3333,7 @@ function openSettings() {
     return [
       h('h2', null, '設定'),
       h('p', { class: 'lead' }, '資料預設只存在這個瀏覽器（已加密）。想讓手機與電腦同步，請開啟下方「雲端同步」；也可以用「匯出備份／匯入備份」手動搬移。'),
+      profileSection(close),
       h('div', { class: 'row2' }, udCtl, themeCtl),
       h('div', { class: 'field', style: { marginTop: '12px' } }, h('label', { for: 'idle' }, '閒置自動鎖定'), idle),
       h('div', { class: 'sec' },
@@ -3209,9 +3359,9 @@ function openSettings() {
         h('div', { class: 'btnrow' },
           h('button', { class: 'btn', type: 'button', onclick: () => { close(); openChangePin(); } }, '修改密碼'),
           h('button', { class: 'btn danger', type: 'button', onclick: async () => {
-            const ok = await confirmDialog({ title: '清除所有資料？', body: '這會永久刪除這個瀏覽器裡的所有交易紀錄與設定，無法復原。建議先匯出備份。', confirm: '清除全部', danger: true });
+            const ok = await confirmDialog({ title: '清除所有資料？', body: '這會永久刪除「' + profileName(session.id) + '」這個帳本裡的所有交易紀錄與設定，無法復原。建議先匯出備份。其他帳本不受影響。', confirm: '清除全部', danger: true });
             if (!ok) return;
-            Vault.reset(); lockNow();
+            Vault.reset(session.id); lockNow();
           } }, '清除所有資料')),
         pinErr),
       h('div', { class: 'dlg-actions' }, h('button', { class: 'btn primary', type: 'button', onclick: () => close(true) }, '完成')),
@@ -3274,8 +3424,8 @@ function openChangePin() {
       err.textContent = '';
       if (![get(cur), get(n1), get(n2)].every((v) => /^\d{4}$/.test(v))) { err.textContent = '密碼必須是 4 位數字。'; return; }
       if (get(n1) !== get(n2)) { err.textContent = '兩次輸入的新密碼不一致。'; return; }
-      try { await Vault.unlock(get(cur)); } catch (e) { err.textContent = '目前密碼不正確。'; return; }
-      try { session = await Vault.rekey(get(n1), JSON.parse(JSON.stringify(data))); }
+      try { await Vault.unlock(session.id, get(cur)); } catch (e) { err.textContent = '目前密碼不正確。'; return; }
+      try { session = await Vault.rekey(session.id, get(n1), JSON.parse(JSON.stringify(data))); }
       catch (e) { err.textContent = '儲存失敗，請重試。'; return; }
       close(true); toast('密碼已更新');
     };
