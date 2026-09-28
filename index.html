@@ -22,6 +22,7 @@
   --c-other: #a9a8a1;
   --txt-red: #d03b3b; --txt-green: #006300;
   --danger: #d03b3b; --st-good: #0ca30c; --st-warn: #fab219; --st-bad: #d03b3b;
+  --col-avgcost: #2a78d6; --col-costamt: #a16207;
   --cost-fill: #ffffff; --cost-stroke: #8f8e88;
 }
 @media (prefers-color-scheme: dark) {
@@ -33,6 +34,7 @@
     --hover: rgba(255, 255, 255, 0.07);
     --accent: #3987e5; --accent-ink: #0b0b0b;
     --c1: #3987e5; --c2: #d95926; --c3: #199e70; --c4: #c98500;
+    --col-avgcost: #5b9cf0; --col-costamt: #eab308;
     --c5: #d55181; --c6: #008300; --c7: #9085e9; --c8: #e66767;
     --c-other: #5a5a56;
     --txt-red: #e66767; --txt-green: #0ca30c; --danger: #e66767;
@@ -47,6 +49,7 @@
     --hover: rgba(255, 255, 255, 0.07);
     --accent: #3987e5; --accent-ink: #0b0b0b;
     --c1: #3987e5; --c2: #d95926; --c3: #199e70; --c4: #c98500;
+    --col-avgcost: #5b9cf0; --col-costamt: #eab308;
     --c5: #d55181; --c6: #008300; --c7: #9085e9; --c8: #e66767;
     --c-other: #5a5a56;
     --txt-red: #e66767; --txt-green: #0ca30c; --danger: #e66767;
@@ -191,6 +194,11 @@ svg.chart, svg.alloc { display: block; width: 100%; height: auto; max-width: 100
 .tip-val.strong { font-weight: 650; }
 
 /* ---------- 表格 ---------- */
+.col-avgcost { color: var(--col-avgcost); font-weight: 600; }
+.col-costamt { color: var(--col-costamt); font-weight: 600; }
+.tgt-input { width: 9em; min-height: 32px; padding: 4px 8px; }
+.tgt-input::placeholder { color: var(--ink-3); }
+
 .tablewrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 th { text-align: right; font-weight: 500; color: var(--ink-2); font-size: 12.5px; padding: 6px 8px; border-bottom: 1px solid var(--axis); white-space: nowrap; }
@@ -722,7 +730,13 @@ const Engine = (function () {
         pnl: r.value - net, pct: r.bought > EPS ? (r.value - net) / r.bought : null,
       });
     }
-    return out.sort((a, b) => b.height - a.height);
+    // 依報酬率（未實現＋已實現的總報酬 ÷ 累計買入成本）由高到低排序；沒有成本可比的（例如空投）排最後
+    return out.sort((a, b) => {
+      if (a.pct == null && b.pct == null) return b.height - a.height;
+      if (a.pct == null) return 1;
+      if (b.pct == null) return -1;
+      return b.pct - a.pct;
+    });
   }
 
   /** 找到某幣種在 ts（含）之前最後一筆成交價；找不到回傳 null */
@@ -795,20 +809,45 @@ const SyncCore = (function () {
     return { id: t.id, ts: t.ts, type: t.type, asset: t.asset, qty: t.qty, price: t.price, fee: t.fee || 0, fx: t.fx == null ? null : t.fx, note: t.note || '', u: t.u > 0 ? +t.u : 0 };
   }
 
-  /** 本機資料 → 要同步的內容（只含交易、刪除墓碑、手動價格；不含設定與 Token） */
+  /** 幣種 → 數值 的小表格（手動價格、目標價共用這個形狀）：{ASSET: {p, at}} */
+  function mapOf(vals, ats) {
+    const out = {};
+    const assets = {};
+    Object.keys(vals || {}).forEach((a) => { assets[a] = 1; });
+    Object.keys(ats || {}).forEach((a) => { assets[a] = 1; });
+    Object.keys(assets).sort().forEach((a) => {
+      out[a] = { p: vals && vals[a] > 0 ? +vals[a] : null, at: (ats && +ats[a]) || 0 };
+    });
+    return out;
+  }
+  function mergeMap(a, b) {
+    const out = {};
+    const assets = {};
+    Object.keys(a || {}).forEach((k) => { assets[k] = 1; });
+    Object.keys(b || {}).forEach((k) => { assets[k] = 1; });
+    Object.keys(assets).sort().forEach((k) => {
+      const win = pickNewer(a && a[k], b && b[k], 'at');
+      out[k] = { p: win.p > 0 ? +win.p : null, at: win.at || 0 };
+    });
+    return out;
+  }
+  function applyMap(map) {
+    const vals = {}, ats = {};
+    Object.keys(map).forEach((k) => {
+      if (map[k].p > 0) vals[k] = map[k].p;
+      if (map[k].at) ats[k] = map[k].at;
+    });
+    return { vals, ats };
+  }
+
+  /** 本機資料 → 要同步的內容（只含交易、刪除墓碑、手動價格、目標價；不含設定與 Token） */
   function payloadOf(d) {
     const txs = (d.txs || []).map(cleanTx).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     const deleted = {};
     Object.keys(d.deleted || {}).sort().forEach((id) => { deleted[id] = +d.deleted[id]; });
-    const mp = {};
-    const assets = {};
-    Object.keys(d.manualPrices || {}).forEach((a) => { assets[a] = 1; });
-    Object.keys(d.mpAt || {}).forEach((a) => { assets[a] = 1; });
-    Object.keys(assets).sort().forEach((a) => {
-      const p = d.manualPrices && d.manualPrices[a] > 0 ? +d.manualPrices[a] : null;
-      mp[a] = { p, at: (d.mpAt && +d.mpAt[a]) || 0 };
-    });
-    return { v: 1, txs, deleted, mp };
+    const mp = mapOf(d.manualPrices, d.mpAt);
+    const tp = mapOf(d.targets, d.targetAt);
+    return { v: 1, txs, deleted, mp, tp };
   }
 
   function canon(p) { return JSON.stringify(p); }
@@ -837,29 +876,21 @@ const SyncCore = (function () {
       txs.push(cleanTx(t));
     });
     txs.sort((x, y) => (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
-    const mp = {};
-    const assets = {};
-    Object.keys(a.mp || {}).forEach((k) => { assets[k] = 1; });
-    Object.keys(b.mp || {}).forEach((k) => { assets[k] = 1; });
-    Object.keys(assets).sort().forEach((k) => {
-      const win = pickNewer(a.mp && a.mp[k], b.mp && b.mp[k], 'at');
-      mp[k] = { p: win.p > 0 ? +win.p : null, at: win.at || 0 };
-    });
+    const mp = mergeMap(a.mp, b.mp);
+    const tp = mergeMap(a.tp, b.tp);
     const dl = {};
     Object.keys(deleted).sort().forEach((id) => { dl[id] = deleted[id]; });
-    return { v: 1, txs, deleted: dl, mp };
+    return { v: 1, txs, deleted: dl, mp, tp };
   }
 
   /** 把合併結果寫回本機資料物件（就地修改；設定與 sync 設定不動） */
   function applyTo(d, p) {
     d.txs = p.txs.map((t) => Object.assign({}, t));
     d.deleted = Object.assign({}, p.deleted);
-    d.manualPrices = {};
-    d.mpAt = {};
-    Object.keys(p.mp).forEach((k) => {
-      if (p.mp[k].p > 0) d.manualPrices[k] = p.mp[k].p;
-      if (p.mp[k].at) d.mpAt[k] = p.mp[k].at;
-    });
+    const mp = applyMap(p.mp);
+    d.manualPrices = mp.vals; d.mpAt = mp.ats;
+    const tp = applyMap(p.tp || {});
+    d.targets = tp.vals; d.targetAt = tp.ats;
     return d;
   }
 
@@ -1625,7 +1656,7 @@ function applyUd() {
 
 /* ---------- 資料 ---------- */
 function defaultData() {
-  return { v: 1, settings: { cur: 'USDT', method: 'avg', range: 'ALL', ud: 'red-up', fxManual: null, idleMin: 5, order: null }, txs: [], manualPrices: {}, deleted: {}, mpAt: {}, sync: null };
+  return { v: 1, settings: { cur: 'USDT', method: 'avg', range: 'ALL', ud: 'red-up', fxManual: null, idleMin: 5, order: null }, txs: [], manualPrices: {}, deleted: {}, mpAt: {}, targets: {}, targetAt: {}, sync: null };
 }
 function normalize(d) {
   const out = defaultData();
@@ -1642,6 +1673,9 @@ function normalize(d) {
   }));
   for (const id in (d.deleted || {})) if (d.deleted[id] > 0) out.deleted[id] = +d.deleted[id];
   for (const k in (d.mpAt || {})) if (d.mpAt[k] > 0) out.mpAt[k.toUpperCase()] = +d.mpAt[k];
+  const tp = d.targets || {};
+  for (const k in tp) if (tp[k] > 0) out.targets[k.toUpperCase()] = +tp[k];
+  for (const k in (d.targetAt || {})) if (d.targetAt[k] > 0) out.targetAt[k.toUpperCase()] = +d.targetAt[k];
   const sy = d.sync;
   if (sy && sy.owner && sy.repo && sy.token && sy.pw) out.sync = { owner: String(sy.owner), repo: String(sy.repo), token: String(sy.token), pw: String(sy.pw), path: 'ledger.sync.json' };
   const mp = d.manualPrices || {};
@@ -2440,7 +2474,52 @@ const HCOLS = [
   ['幣種', 'asset', 'asc', (r) => r.asset], ['持有量', 'qty', 'desc', (r) => r.qty], ['平均成本', 'avgCost', 'desc', (r) => r.avgCost],
   ['成本金額', 'cost', 'desc', (r) => r.cost], ['現價', 'price', 'desc', (r) => r.price], ['24h', 'pct', 'desc', (r) => r.pct],
   ['市值', 'value', 'desc', (r) => r.value], ['占比', 'share', 'desc', (r) => r.share], ['未實現損益', 'unrealized', 'desc', (r) => r.unrealized],
-  ['已實現', 'realized', 'desc', (r) => r.realized]];
+  ['已實現', 'realized', 'desc', (r) => r.realized], ['目標價', 'target', 'desc', (r) => targetDisplay(r.asset)],
+  ['預計收益', 'expProfit', 'desc', (r) => expectedProfit(r)]];
+/** 目標價存的是 USDT（跟手動價格同一套慣例），依目前顯示幣別換算 */
+function targetDisplay(asset) {
+  const t = data.targets[asset];
+  if (!(t > 0)) return null;
+  return t * ((lastC && lastC.fxNow) || 1);
+}
+function expectedProfit(r) {
+  const t = targetDisplay(r.asset);
+  if (t == null || r.avgCost == null) return null;
+  return (t - r.avgCost) * r.qty;
+}
+function expectedPct(r) {
+  const t = targetDisplay(r.asset);
+  if (t == null || !(r.avgCost > 0)) return null;
+  return (t - r.avgCost) / r.avgCost;
+}
+/** 輸入框顯示用：目前顯示幣別下的數字，去掉多餘小數與千分位 */
+function targetInputVal(r) {
+  const t = targetDisplay(r.asset);
+  return t == null ? '' : String(Math.round(t * 1e8) / 1e8);
+}
+function setTargetPrice(asset, displayVal) {
+  const before = Object.assign({}, data.targets);
+  const fx = (lastC && lastC.fxNow) || 1;
+  const usdt = displayVal > 0 ? displayVal / fx : null;
+  if (usdt > 0) data.targets[asset] = usdt; else delete data.targets[asset];
+  data.targetAt = SyncCore.stampMp(before, data.targetAt, data.targets, Date.now());
+}
+/** 持倉表裡直接編輯的「目標價」欄位：輸入的數字視為目前顯示幣別，離開輸入框才儲存 */
+function targetInput(r, cur) {
+  const commit = (e) => {
+    const v = e.target.value.trim();
+    const n = v === '' ? null : parseFloat(v);
+    setTargetPrice(r.asset, n > 0 ? n : null);
+    persist();
+    renderLive();
+  };
+  return h('input', {
+    type: 'number', class: 'tgt-input num', inputmode: 'decimal', min: '0', step: 'any',
+    'aria-label': r.asset + ' 目標價（' + cur + '）', placeholder: '未設定',
+    value: targetInputVal(r), onchange: commit,
+    onkeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); } },
+  });
+}
 const HSORT_EXTRA = [['未實現報酬率 %', 'unrealizedPct', 'desc', (r) => r.unrealizedPct]];
 function hSortDef(key) { return HCOLS.concat(HSORT_EXTRA).filter((c) => c[1] === key)[0] || HCOLS[6]; }
 function buildHoldBar() {
@@ -2490,15 +2569,18 @@ function renderHoldings(C) {
       h('td', { 'data-label': '幣種' }, h('span', { class: 'asset' },
         h('span', { class: 'lg-box', style: { background: c || 'var(--c-other)' } }), r.asset)),
       h('td', { 'data-label': '持有量' }, fmtQty(r.qty)),
-      h('td', { 'data-label': '平均成本' }, fmtPrice(r.avgCost, cur)),
-      h('td', { 'data-label': '成本金額' }, r.cost != null ? fmtMoney(r.cost, cur) : '—'),
+      h('td', { 'data-label': '平均成本', class: 'col-avgcost' }, fmtPrice(r.avgCost, cur)),
+      h('td', { 'data-label': '成本金額', class: 'col-costamt' }, r.cost != null ? fmtMoney(r.cost, cur) : '—'),
       priceCell,
       h('td', { 'data-label': '24h', class: signClass(r.pct) }, r.pct != null ? arrow(r.pct) + fmtPct(r.pct / 100, true) : '—'),
       h('td', { 'data-label': '市值' }, r.value != null ? fmtMoney(r.value, cur) : '—'),
       h('td', { 'data-label': '占比' }, r.share != null ? fmtPct(r.share) : '—'),
       h('td', { 'data-label': '未實現損益', class: signClass(r.unrealized) },
         r.unrealized != null ? arrow(r.unrealized) + fmtSigned(r.unrealized, cur) + '（' + fmtPct(r.unrealizedPct, true) + '）' : '—'),
-      h('td', { 'data-label': '已實現', class: signClass(r.realized) }, fmtSigned(r.realized, cur)));
+      h('td', { 'data-label': '已實現', class: signClass(r.realized) }, fmtSigned(r.realized, cur)),
+      h('td', { 'data-label': '目標價（' + cur + '）' }, targetInput(r, cur)),
+      h('td', { 'data-label': '預計收益', class: signClass(expectedProfit(r)) },
+        expectedProfit(r) != null ? arrow(expectedProfit(r)) + fmtSigned(expectedProfit(r), cur) + (expectedPct(r) != null ? '（' + fmtPct(expectedPct(r), true) + '）' : '') : '—'));
   });
   // 合計：沒篩選時用全部持倉（已實現含已清倉）；篩選時只加總顯示中的幣種
   const sum = (f) => shown.reduce((a, r) => a + (f(r) || 0), 0);
@@ -2508,11 +2590,17 @@ function renderHoldings(C) {
   const tReal = active ? sum((r) => r.realized) : S.realized;
   const tfoot = h('tfoot', null, h('tr', null,
     h('td', { 'data-label': '合計' }, active ? '合計（篩選）' : '合計'), h('td'), h('td'),
-    h('td', { 'data-label': '成本金額' }, fmtMoney(tCost, cur)),
+    h('td', { 'data-label': '成本金額', class: 'col-costamt' }, fmtMoney(tCost, cur)),
     h('td'), h('td'),
     h('td', { 'data-label': '市值' }, fmtMoney(tValue, cur)), h('td'),
     h('td', { 'data-label': '未實現損益', class: signClass(tUnreal) }, pnlText(tUnreal, cur)),
-    h('td', { 'data-label': active ? '已實現' : '已實現（含已清倉）', class: signClass(tReal) }, fmtSigned(tReal, cur))));
+    h('td', { 'data-label': active ? '已實現' : '已實現（含已清倉）', class: signClass(tReal) }, fmtSigned(tReal, cur)),
+    h('td'),
+    (() => {
+      const has = shown.some((r) => expectedProfit(r) != null);
+      const tExp = sum((r) => expectedProfit(r));
+      return h('td', { 'data-label': '預計收益', class: has ? signClass(tExp) : '' }, has ? fmtSigned(tExp, cur) : '—');
+    })()));
   const onSort = (key) => { uiState.hSort = nextSort(uiState.hSort, key, hSortDef(key)[2]); renderHoldings(lastC); };
   el.holdBody.appendChild(h('div', { class: 'tablewrap' }, h('table', { class: 'rt' },
     h('thead', null, h('tr', null, HCOLS.map((c) => sortHead(c[0], c[1], uiState.hSort, onSort)))),
