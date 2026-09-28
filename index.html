@@ -714,7 +714,11 @@ const Engine = (function () {
    *   net ≤ 0：已取回全部成本 → 只留 profit = 目前市值（白色成本消失）
    * pnl = 市值 − net = 已實現 + 未實現（總損益）。
    */
-  function assetBars(rows) {
+  function assetBars(rows, opts) {
+    opts = opts || {};
+    const sortBy = opts.sortBy === 'amount' ? 'amount' : 'pct';
+    const dir = opts.dir === 'asc' ? 'asc' : 'desc';
+    const mul = dir === 'asc' ? -1 : 1;
     const out = [];
     for (const r of rows) {
       if (r.value == null) continue;
@@ -730,13 +734,64 @@ const Engine = (function () {
         pnl: r.value - net, pct: r.bought > EPS ? (r.value - net) / r.bought : null,
       });
     }
-    // 依報酬率（未實現＋已實現的總報酬 ÷ 累計買入成本）由高到低排序；沒有成本可比的（例如空投）排最後
+    // 依報酬率（未實現＋已實現的總報酬 ÷ 累計買入成本）或金額（總損益）排序，方向可指定；
+    // 沒有成本可比的（例如空投）永遠排最後，跟排序方向無關
     return out.sort((a, b) => {
-      if (a.pct == null && b.pct == null) return b.height - a.height;
-      if (a.pct == null) return 1;
-      if (b.pct == null) return -1;
-      return b.pct - a.pct;
+      const av = sortBy === 'amount' ? a.pnl : a.pct;
+      const bv = sortBy === 'amount' ? b.pnl : b.pct;
+      if (sortBy === 'pct') {
+        if (a.pct == null && b.pct == null) return b.height - a.height;
+        if (a.pct == null) return 1;
+        if (b.pct == null) return -1;
+      }
+      return mul * (bv - av);
     });
+  }
+
+  /**
+   * 單一方向（獲利或虧損）的門檻跨越狀態機。
+   * tiers：由小到大排序的門檻（百分比數字，例如 [50,100]）。
+   * pctAbs：目前幅度（百分比，非負；跨方向的判斷交給呼叫端，這裡只管「有沒有超過門檻」）。
+   * prevIdx：目前已觸發到的最高門檻索引（-1 = 尚未觸發任何一階）。
+   * hysteresis：回落多少個百分點以下才允許同一階重新觸發（避免在門檻邊界來回抖動狂發訊號）。
+   * 回傳 { idx, crossed }：crossed 是這次新跨過（由低到高）的門檻值陣列。
+   */
+  function tierState(pctAbs, tiers, prevIdx, hysteresis) {
+    hysteresis = hysteresis || 0;
+    let idx = prevIdx == null ? -1 : prevIdx;
+    if (idx >= tiers.length) idx = tiers.length - 1;
+    const crossed = [];
+    while (idx >= 0 && pctAbs < tiers[idx] - hysteresis) idx--;
+    while (idx + 1 < tiers.length && pctAbs >= tiers[idx + 1]) { idx++; crossed.push(tiers[idx]); }
+    return { idx, crossed };
+  }
+
+  /**
+   * 依目前各幣種報酬率（bars 的 pct，來自 assetBars）比對使用者設定的獲利/虧損門檻，
+   * 找出「這次新跨過」的門檻，並回傳更新後的每幣種跨越狀態（給下次呼叫延續使用，做遲滯判斷）。
+   * cfg: { profitTiers:[...], lossTiers:[...], hysteresis }
+   * state: 上次的 { [asset]: { profitIdx, lossIdx } }（可為 null/{}）
+   */
+  function checkAlerts(bars, cfg, state) {
+    cfg = cfg || {};
+    const profitTiers = Array.isArray(cfg.profitTiers) ? cfg.profitTiers : [];
+    const lossTiers = Array.isArray(cfg.lossTiers) ? cfg.lossTiers : [];
+    const hysteresis = cfg.hysteresis || 0;
+    state = state || {};
+    const nextState = {};
+    const events = [];
+    for (const b of bars) {
+      if (b.pct == null) continue;
+      const prev = state[b.asset] || { profitIdx: -1, lossIdx: -1 };
+      const pctPt = b.pct * 100;
+      const pr = tierState(pctPt, profitTiers, prev.profitIdx, hysteresis);
+      const lossAbs = pctPt < 0 ? -pctPt : 0;
+      const lo = tierState(lossAbs, lossTiers, prev.lossIdx, hysteresis);
+      nextState[b.asset] = { profitIdx: pr.idx, lossIdx: lo.idx };
+      pr.crossed.forEach((t) => events.push({ asset: b.asset, kind: 'profit', tier: t }));
+      lo.crossed.forEach((t) => events.push({ asset: b.asset, kind: 'loss', tier: t }));
+    }
+    return { state: nextState, events };
   }
 
   /** 找到某幣種在 ts（含）之前最後一筆成交價；找不到回傳 null */
@@ -789,7 +844,7 @@ const Engine = (function () {
     return pts;
   }
 
-  return { EPS, sortTx, replay, summarize, assetBars, netWorthSeries, lastTradePrice };
+  return { EPS, sortTx, replay, summarize, assetBars, tierState, checkAlerts, netWorthSeries, lastTradePrice };
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports = Engine;
 
@@ -1627,7 +1682,7 @@ function defaultUi() {
   return {
     txAsset: '', txType: '', txQ: '', txFrom: '', txTo: '', txSort: { key: 'ts', dir: 'desc' },
     hQ: '', hPnl: '', hSort: { key: 'value', dir: 'desc' },
-    chartTable: false, barsTable: false, barsMode: 'amount', retTable: false,
+    chartTable: false, barsTable: false, barsMode: 'amount', barsDir: 'desc', retTable: false,
   };
 }
 let uiState = defaultUi();
@@ -1655,14 +1710,41 @@ function applyUd() {
 }
 
 /* ---------- 資料 ---------- */
+const ALERT_HYSTERESIS = 2; // 百分點：回落多少以下才重新允許同一階再次觸發，避免在門檻邊界抖動狂發訊號
 function defaultData() {
-  return { v: 1, settings: { cur: 'USDT', method: 'avg', range: 'ALL', ud: 'red-up', fxManual: null, idleMin: 5, order: null }, txs: [], manualPrices: {}, deleted: {}, mpAt: {}, targets: {}, targetAt: {}, sync: null };
+  return {
+    v: 1,
+    settings: {
+      cur: 'USDT', method: 'avg', range: 'ALL', ud: 'red-up', fxManual: null, idleMin: 5, order: null,
+      alertProfitTiers: [50, 100], alertLossTiers: [10, 20],
+    },
+    txs: [], manualPrices: {}, deleted: {}, mpAt: {}, targets: {}, targetAt: {}, sync: null,
+    alertState: {}, alertLog: [],
+  };
+}
+function cleanTiers(arr, def) {
+  const nums = (Array.isArray(arr) ? arr : []).map((x) => Math.round((+x) * 100) / 100).filter((x) => isFinite(x) && x > 0);
+  const uniq = Array.from(new Set(nums)).sort((a, b) => a - b);
+  return uniq.length ? uniq : def.slice();
 }
 function normalize(d) {
   const out = defaultData();
   d = d || {};
   Object.assign(out.settings, d.settings || {});
   out.settings.order = cleanOrder(out.settings.order);
+  out.settings.alertProfitTiers = cleanTiers(out.settings.alertProfitTiers, [50, 100]);
+  out.settings.alertLossTiers = cleanTiers(out.settings.alertLossTiers, [10, 20]);
+  const asRaw = d.alertState || {};
+  for (const k in asRaw) {
+    const v = asRaw[k];
+    if (!v || typeof v !== 'object') continue;
+    const pi = isFinite(v.profitIdx) ? Math.max(-1, Math.floor(v.profitIdx)) : -1;
+    const li = isFinite(v.lossIdx) ? Math.max(-1, Math.floor(v.lossIdx)) : -1;
+    out.alertState[k.toUpperCase()] = { profitIdx: pi, lossIdx: li };
+  }
+  out.alertLog = (Array.isArray(d.alertLog) ? d.alertLog : []).filter((e) =>
+    e && typeof e.id === 'string' && typeof e.asset === 'string' && (e.kind === 'profit' || e.kind === 'loss') && isFinite(e.tier) && isFinite(e.ts)
+  ).map((e) => ({ id: e.id, asset: e.asset.toUpperCase(), kind: e.kind, tier: +e.tier, ts: +e.ts, dismissed: !!e.dismissed })).slice(0, 50);
   out.txs = (Array.isArray(d.txs) ? d.txs : []).filter((t) =>
     t && typeof t.id === 'string' && isFinite(t.ts) && (t.type === 'buy' || t.type === 'sell') &&
     typeof t.asset === 'string' && t.qty > 0 && isFinite(t.qty) && t.price >= 0 && isFinite(t.price)
@@ -1792,8 +1874,44 @@ function compute() {
     return p ? { price: p.price * fxNow, pct: p.pct, src: p.src } : null;
   });
   lastC = { cur, fxNow, method, fxOf, result, summary };
+  applyAlertCheck(lastC);
   return lastC;
 }
+
+/* ---------- 訊號提醒（獲利/虧損跨門檻） ---------- */
+function applyAlertCheck(C) {
+  if (!data || market.status !== 'ok') return; // 還沒拿到本次即時價格前，先不判斷：剛解鎖/重新整理時會暫時退回成交價估值，報酬率不準，容易誤判成跨越或解除門檻
+  const bars = Engine.assetBars(C.summary.rows);
+  const cfg = { profitTiers: data.settings.alertProfitTiers, lossTiers: data.settings.alertLossTiers, hysteresis: ALERT_HYSTERESIS };
+  const res = Engine.checkAlerts(bars, cfg, data.alertState);
+  const changed = JSON.stringify(res.state) !== JSON.stringify(data.alertState);
+  if (res.events.length) {
+    const now = Date.now();
+    res.events.forEach((e) => data.alertLog.unshift({ id: uid(), asset: e.asset, kind: e.kind, tier: e.tier, ts: now, dismissed: false }));
+    if (data.alertLog.length > 50) data.alertLog.length = 50;
+  }
+  if (changed || res.events.length) {
+    data.alertState = res.state;
+    touchData();
+    persist();
+  }
+}
+function activeAlerts() { return (data.alertLog || []).filter((e) => !e.dismissed); }
+function dismissAlert(id) {
+  const e = (data.alertLog || []).find((x) => x.id === id);
+  if (!e) return;
+  e.dismissed = true;
+  touchData();
+  persist();
+  renderNotices(lastC || compute());
+}
+function dismissAllAlerts() {
+  (data.alertLog || []).forEach((e) => { e.dismissed = true; });
+  touchData();
+  persist();
+  renderNotices(lastC || compute());
+}
+
 function heldAssets() {
   const r = Engine.replay(data.txs, { method: 'avg' });
   return Object.keys(r.positions).filter((a) => r.positions[a].qty > 0 && a !== 'USDT');
@@ -2072,6 +2190,10 @@ function renderNotices(C) {
     list.push(notice('有 ' + C.result.issues.length + ' 筆賣出超過當時持有量（例如 ' + i.asset + '），請檢查交易紀錄。'));
   }
   if (syncSt.status === 'error' && syncSt.code !== 'NETWORK' && syncSt.code !== 'RATE') list.push(notice('雲端同步失敗：' + syncSt.error, ['重試', () => runSync('manual')]));
+  activeAlerts().forEach((a) => {
+    const text = a.asset + '：報酬率已' + (a.kind === 'profit' ? '達到 +' + num(a.tier) + '% 獲利' : '下跌 −' + num(a.tier) + '%');
+    list.push(notice(text, ['知道了', () => dismissAlert(a.id)]));
+  });
   list.forEach((n) => el.notices.appendChild(n));
 }
 
@@ -2373,13 +2495,16 @@ function renderBars(C) {
   C = C || lastC || compute();
   clear(el.bars);
   const cur = C.cur;
-  const bars = Engine.assetBars(C.summary.rows);
+  const bars = Engine.assetBars(C.summary.rows, { sortBy: uiState.barsMode === 'pct' ? 'pct' : 'amount', dir: uiState.barsDir });
   const modeCtl = h('div', { class: 'segctl', role: 'radiogroup', 'aria-label': '直條單位' },
     [['amount', '金額'], ['pct', '報酬率 %']].map((o) => h('button', { type: 'button', role: 'radio', 'aria-checked': String(uiState.barsMode === o[0]),
       onclick: () => { uiState.barsMode = o[0]; renderBars(); } }, o[1])));
+  const dirBtn = h('button', { class: 'btn small', type: 'button', title: '切換排序方向',
+    onclick: () => { uiState.barsDir = uiState.barsDir === 'asc' ? 'desc' : 'asc'; renderBars(); } }, dirLabel(uiState.barsDir));
   el.bars.appendChild(h('div', { class: 'card-head' },
     h('h2', null, '各幣種成本與損益'),
-    bars.length && !uiState.barsTable ? modeCtl : null,
+    bars.length ? modeCtl : null,
+    bars.length ? dirBtn : null,
     bars.length ? h('button', { class: 'btn small', type: 'button', 'aria-pressed': String(uiState.barsTable),
       onclick: () => { uiState.barsTable = !uiState.barsTable; renderBars(); } }, uiState.barsTable ? '顯示圖表' : '表格檢視') : null));
   if (!bars.length) { el.bars.appendChild(h('p', { class: 'muted' }, '目前沒有可估值的持倉。')); return; }
@@ -3387,6 +3512,53 @@ function profileSection(closeSettings) {
   return box;
 }
 
+/* ---------- 訊號提醒設定 ---------- */
+function alertSection() {
+  const box = h('div', { class: 'sec' });
+  const err = h('div', { class: 'err', role: 'alert' });
+  const paint = () => {
+    clear(box);
+    const s0 = data.settings;
+    const profitIn = h('input', { type: 'text', id: 'al-profit', value: s0.alertProfitTiers.join(', '), placeholder: '例如 50, 100', inputmode: 'decimal', autocomplete: 'off' });
+    const lossIn = h('input', { type: 'text', id: 'al-loss', value: s0.alertLossTiers.join(', '), placeholder: '例如 10, 20', inputmode: 'decimal', autocomplete: 'off' });
+    box.appendChild(h('h3', null, '訊號提醒'));
+    box.appendChild(h('p', { class: 'hint muted' },
+      '每個持有幣種的報酬率（未實現＋已實現的總報酬 ÷ 累計買入成本，跟「各幣種成本與損益」報酬率一致）達到下面設定的獲利或虧損門檻時，畫面上方會跳出提醒。只是網頁內的提醒列：分頁或瀏覽器關閉時不會收到通知，這是純前端網頁、沒有伺服器能力所致。'));
+    box.appendChild(field('獲利門檻（% ，用逗號分開多階）', profitIn, null, 'al-profit'));
+    box.appendChild(field('虧損門檻（% ，用逗號分開多階）', lossIn, null, 'al-loss'));
+    box.appendChild(h('div', { class: 'btnrow' },
+      h('button', { class: 'btn', type: 'button', onclick: () => {
+        const pt = cleanTiers(profitIn.value.split(',').map((x) => parseFloat(x)), [50, 100]);
+        const lt = cleanTiers(lossIn.value.split(',').map((x) => parseFloat(x)), [10, 20]);
+        const profitChanged = JSON.stringify(pt) !== JSON.stringify(s0.alertProfitTiers);
+        const lossChanged = JSON.stringify(lt) !== JSON.stringify(s0.alertLossTiers);
+        data.settings.alertProfitTiers = pt; data.settings.alertLossTiers = lt;
+        // 只重置真的改變的那一邊，避免另一邊（沒改動）被重新觸發、造成不必要的重複提醒
+        if (profitChanged || lossChanged) {
+          for (const a in data.alertState) {
+            if (profitChanged) data.alertState[a].profitIdx = -1;
+            if (lossChanged) data.alertState[a].lossIdx = -1;
+          }
+        }
+        touchData(); persist(); err.textContent = ''; toast('已更新訊號門檻'); paint();
+      } }, '套用')));
+    box.appendChild(err);
+    const log = data.alertLog || [];
+    if (log.length) {
+      box.appendChild(h('h4', { style: { marginTop: '10px' } }, '最近的訊號'));
+      box.appendChild(h('div', { class: 'proflist' }, log.slice(0, 10).map((a) =>
+        h('div', { class: 'profrow' },
+          h('span', { class: 'pname' }, fmtDT(a.ts) + '　' + a.asset + '　' + (a.kind === 'profit' ? '+' : '−') + num(a.tier) + '%' + (a.dismissed ? '' : '（未讀）'))))));
+      box.appendChild(h('div', { class: 'btnrow', style: { marginTop: '6px' } },
+        h('button', { class: 'btn small', type: 'button', onclick: () => {
+          data.alertLog = []; touchData(); persist(); renderNotices(lastC || compute()); paint();
+        } }, '清除訊號紀錄')));
+    }
+  };
+  paint();
+  return box;
+}
+
 /* ---------- 設定 ---------- */
 function openSettings() {
   return modal((close) => {
@@ -3441,6 +3613,7 @@ function openSettings() {
           h('button', { class: 'btn', type: 'button', onclick: () => fileIn.click() }, '匯入備份'),
           h('button', { class: 'btn', type: 'button', onclick: exportCsv }, '匯出 CSV'),
           fileIn)),
+      alertSection(),
       syncSection(),
       h('div', { class: 'sec' },
         h('h3', null, '安全'),
