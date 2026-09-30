@@ -196,7 +196,8 @@ svg.chart, svg.alloc { display: block; width: 100%; height: auto; max-width: 100
 /* ---------- 表格 ---------- */
 .col-avgcost { color: var(--col-avgcost); font-weight: 600; }
 .col-costamt { color: var(--col-costamt); font-weight: 600; }
-.tgt-input { width: 9em; min-height: 32px; padding: 4px 8px; }
+.col-expprofit { color: var(--col-costamt); font-weight: 600; }
+.tgt-input { width: 11em; min-height: 40px; padding: 8px 10px; font-size: 15px; }
 .tgt-input::placeholder { color: var(--ink-3); }
 
 .tablewrap { overflow-x: auto; }
@@ -279,6 +280,8 @@ dialog.dlg::backdrop { background: rgba(0, 0, 0, 0.5); }
   table.rt td.act { justify-content: flex-end; }
   table.rt td.act::before { content: none; }
   table.rt .note { max-width: 60%; }
+  table.rt td.tgt-cell { flex-direction: column; align-items: stretch; gap: 6px; }
+  table.rt td.tgt-cell .tgt-input { width: 100%; }
   table.rt tfoot tr { background: var(--hover); }
   .row2 { grid-template-columns: 1fr; }
 }
@@ -2703,8 +2706,8 @@ function renderHoldings(C) {
       h('td', { 'data-label': '未實現損益', class: signClass(r.unrealized) },
         r.unrealized != null ? arrow(r.unrealized) + fmtSigned(r.unrealized, cur) + '（' + fmtPct(r.unrealizedPct, true) + '）' : '—'),
       h('td', { 'data-label': '已實現', class: signClass(r.realized) }, fmtSigned(r.realized, cur)),
-      h('td', { 'data-label': '目標價（' + cur + '）' }, targetInput(r, cur)),
-      h('td', { 'data-label': '預計收益', class: signClass(expectedProfit(r)) },
+      h('td', { 'data-label': '目標價（' + cur + '）', class: 'tgt-cell' }, targetInput(r, cur)),
+      h('td', { 'data-label': '預計收益', class: 'col-expprofit' },
         expectedProfit(r) != null ? arrow(expectedProfit(r)) + fmtSigned(expectedProfit(r), cur) + (expectedPct(r) != null ? '（' + fmtPct(expectedPct(r), true) + '）' : '') : '—'));
   });
   // 合計：沒篩選時用全部持倉（已實現含已清倉）；篩選時只加總顯示中的幣種
@@ -2724,7 +2727,7 @@ function renderHoldings(C) {
     (() => {
       const has = shown.some((r) => expectedProfit(r) != null);
       const tExp = sum((r) => expectedProfit(r));
-      return h('td', { 'data-label': '預計收益', class: has ? signClass(tExp) : '' }, has ? fmtSigned(tExp, cur) : '—');
+      return h('td', { 'data-label': '預計收益', class: 'col-expprofit' }, has ? fmtSigned(tExp, cur) : '—');
     })()));
   const onSort = (key) => { uiState.hSort = nextSort(uiState.hSort, key, hSortDef(key)[2]); renderHoldings(lastC); };
   el.holdBody.appendChild(h('div', { class: 'tablewrap' }, h('table', { class: 'rt' },
