@@ -22,7 +22,7 @@
   --c-other: #a9a8a1;
   --txt-red: #d03b3b; --txt-green: #006300;
   --danger: #d03b3b; --st-good: #0ca30c; --st-warn: #fab219; --st-bad: #d03b3b;
-  --col-avgcost: #2a78d6; --col-costamt: #a16207;
+  --col-avgcost: #2a78d6; --col-costamt: #a16207; --col-cash: #0ea5b7;
   --cost-fill: #ffffff; --cost-stroke: #8f8e88;
 }
 @media (prefers-color-scheme: dark) {
@@ -34,7 +34,7 @@
     --hover: rgba(255, 255, 255, 0.07);
     --accent: #3987e5; --accent-ink: #0b0b0b;
     --c1: #3987e5; --c2: #d95926; --c3: #199e70; --c4: #c98500;
-    --col-avgcost: #5b9cf0; --col-costamt: #eab308;
+    --col-avgcost: #5b9cf0; --col-costamt: #eab308; --col-cash: #22c7dc;
     --c5: #d55181; --c6: #008300; --c7: #9085e9; --c8: #e66767;
     --c-other: #5a5a56;
     --txt-red: #e66767; --txt-green: #0ca30c; --danger: #e66767;
@@ -49,7 +49,7 @@
     --hover: rgba(255, 255, 255, 0.07);
     --accent: #3987e5; --accent-ink: #0b0b0b;
     --c1: #3987e5; --c2: #d95926; --c3: #199e70; --c4: #c98500;
-    --col-avgcost: #5b9cf0; --col-costamt: #eab308;
+    --col-avgcost: #5b9cf0; --col-costamt: #eab308; --col-cash: #22c7dc;
     --c5: #d55181; --c6: #008300; --c7: #9085e9; --c8: #e66767;
     --c-other: #5a5a56;
     --txt-red: #e66767; --txt-green: #0ca30c; --danger: #e66767;
@@ -213,6 +213,9 @@ tbody tr:hover { background: var(--hover); }
 .tag { display: inline-block; font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 4px; }
 .tag.buy { background: color-mix(in srgb, var(--c1) 14%, transparent); }
 .tag.sell { background: color-mix(in srgb, var(--c2) 18%, transparent); }
+.tag.deposit, .tag.withdraw { background: color-mix(in srgb, var(--col-cash) 18%, transparent); }
+.cashrow td { border-top: 1px dashed var(--axis); }
+.hero-cash { font-size: 13px; margin-top: 2px; }
 .note { max-width: 14ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); }
 td.act { white-space: nowrap; }
 tr.bad td { background: color-mix(in srgb, var(--st-bad) 8%, transparent); }
@@ -280,6 +283,7 @@ dialog.dlg::backdrop { background: rgba(0, 0, 0, 0.5); }
   table.rt td.act { justify-content: flex-end; }
   table.rt td.act::before { content: none; }
   table.rt .note { max-width: 60%; }
+  table.rt td.na { display: none; }
   table.rt td.tgt-cell { flex-direction: column; align-items: stretch; gap: 6px; }
   table.rt td.tgt-cell .tgt-input { width: 100%; }
   table.rt tfoot tr { background: var(--hover); }
@@ -566,11 +570,12 @@ const Profiles = (function () {
 const Engine = (function () {
   const EPS = 1e-9;
 
-  // 同一時間戳：買入排在賣出前面，避免同秒成交被誤判為超賣；最後以 id 穩定排序
+  // 同一時間戳：存入 → 買入 → 賣出 → 提領，避免同秒成交被誤判為超賣／餘額不足；最後以 id 穩定排序
+  const TYPE_RANK = { deposit: 0, buy: 1, sell: 2, withdraw: 3 };
   function sortTx(txs) {
     return txs.slice().sort((a, b) => {
       if (a.ts !== b.ts) return a.ts - b.ts;
-      if (a.type !== b.type) return a.type === 'buy' ? -1 : 1;
+      if (a.type !== b.type) return (TYPE_RANK[a.type] || 0) - (TYPE_RANK[b.type] || 0);
       return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
     });
   }
@@ -597,9 +602,28 @@ const Engine = (function () {
     const positions = {};
     const events = {};
     const issues = [];
+    // USDT 現金餘額（單位固定是 USDT，不受 fxOf 影響）：賣出所得入帳、買入扣除（不足的部分視為帳本外的資金，餘額不會變負）、
+    // 存入加、提領減（超過餘額會被標記並以餘額封頂）。asset 本身是 USDT 的舊紀錄維持原本當作一般持倉的行為，不動餘額。
+    let cash = 0;
 
     for (const tx of sortTx(txs)) {
       if (tx.ts > upTo) break;
+      if (tx.type === 'deposit') {
+        cash += tx.qty;
+        events[tx.id] = { type: 'deposit', total: tx.qty };
+        continue;
+      }
+      if (tx.type === 'withdraw') {
+        let q = tx.qty;
+        if (q > cash + EPS * Math.max(1, cash)) {
+          issues.push({ id: tx.id, kind: 'overwithdraw', asset: 'USDT', short: q - cash });
+          q = Math.max(cash, 0);
+        }
+        cash -= q;
+        if (cash < 1e-12) cash = 0;
+        events[tx.id] = { type: 'withdraw', total: q };
+        continue;
+      }
       const fx = fxOf(tx);
       const price = tx.price * fx;
       const fee = (tx.fee || 0) * fx;
@@ -615,6 +639,7 @@ const Engine = (function () {
         p.boughtQty += tx.qty;
         p.boughtCost += total;
         if (method === 'fifo') p.lots.push({ qty: tx.qty, unit: total / tx.qty });
+        if (tx.asset !== 'USDT') cash = Math.max(0, cash - (tx.qty * tx.price + (tx.fee || 0)));
         events[tx.id] = { type: 'buy', total };
       } else {
         let q = tx.qty;
@@ -645,6 +670,7 @@ const Engine = (function () {
         p.realized += pnl;
         p.soldQty += q;
         p.soldProceeds += proceeds;
+        if (tx.asset !== 'USDT') cash = Math.max(0, cash + q * tx.price - (tx.fee || 0));
         events[tx.id] = { type: 'sell', proceeds, costOut, pnl, qty: q };
       }
 
@@ -655,7 +681,7 @@ const Engine = (function () {
       const p = positions[a];
       p.avgCost = p.qty > 0 ? p.cost / p.qty : 0;
     }
-    return { positions, events, issues };
+    return { positions, events, issues, cash };
   }
 
   /**
@@ -695,16 +721,21 @@ const Engine = (function () {
       rows.push(row);
     }
     rows.sort((x, y) => (y.value || 0) - (x.value || 0));
-    for (const r of rows) r.share = r.value != null && value > 0 ? r.value / value : null;
+    // USDT 現金餘額：計入總資產（totalValue），但不影響持倉成本 / 未實現損益（value 仍只是幣種市值）
+    const cash = result.cash > 0 ? result.cash : 0;
+    let cashValue = 0;
+    if (cash > 0) { const cq = priceOf('USDT'); cashValue = cash * (cq && cq.price > 0 ? cq.price : 1); }
+    const totalValue = value + cashValue;
+    for (const r of rows) r.share = r.value != null && totalValue > 0 ? r.value / totalValue : null;
     const unrealized = value - cost;
     return {
-      rows, missing, value, cost, unrealized,
+      rows, missing, value, cost, unrealized, cash, cashValue, totalValue,
       unrealizedPct: cost > 0 ? unrealized / cost : null,
       realized, bought, fees,
       total: unrealized + realized,
       totalPct: bought > 0 ? (unrealized + realized) / bought : null,
       dayChange,
-      dayChangePct: value - dayChange > 0 ? dayChange / (value - dayChange) : null,
+      dayChangePct: totalValue - dayChange > 0 ? dayChange / (totalValue - dayChange) : null,
     };
   }
 
@@ -835,6 +866,7 @@ const Engine = (function () {
         value += p.qty * px * priceFx;
         cost += p.cost;
       }
+      if (o.includeCash && r.cash > 0) { value += r.cash * priceFx; cost += r.cash * priceFx; } // 現金市值 = 成本，不影響未實現損益
       return { ts, value, cost };
     }
 
@@ -1529,8 +1561,8 @@ function allocBar(container, rows, o) {
   const segs = [];
   const other = { asset: '其他', value: 0, names: [], color: 'var(--c-other)' };
   for (const r of priced) {
-    const color = o.colorOf(r.asset);
-    if (color && r.value / total >= 0.015) segs.push({ asset: r.asset, value: r.value, color });
+    const color = r.isCash ? 'var(--col-cash)' : o.colorOf(r.asset);
+    if (color && (r.isCash || r.value / total >= 0.015)) segs.push({ asset: r.asset, value: r.value, color });
     else { other.value += r.value; other.names.push(r.asset); }
   }
   if (other.value > 0) segs.push(other);
@@ -1749,11 +1781,12 @@ function normalize(d) {
     e && typeof e.id === 'string' && typeof e.asset === 'string' && (e.kind === 'profit' || e.kind === 'loss') && isFinite(e.tier) && isFinite(e.ts)
   ).map((e) => ({ id: e.id, asset: e.asset.toUpperCase(), kind: e.kind, tier: +e.tier, ts: +e.ts, dismissed: !!e.dismissed })).slice(0, 50);
   out.txs = (Array.isArray(d.txs) ? d.txs : []).filter((t) =>
-    t && typeof t.id === 'string' && isFinite(t.ts) && (t.type === 'buy' || t.type === 'sell') &&
+    t && typeof t.id === 'string' && isFinite(t.ts) && (t.type === 'buy' || t.type === 'sell' || t.type === 'deposit' || t.type === 'withdraw') &&
     typeof t.asset === 'string' && t.qty > 0 && isFinite(t.qty) && t.price >= 0 && isFinite(t.price)
   ).map((t) => ({
-    id: t.id, ts: +t.ts, type: t.type, asset: t.asset.toUpperCase(), qty: +t.qty, price: +t.price,
-    fee: t.fee > 0 ? +t.fee : 0, fx: t.fx > 0 ? +t.fx : null, note: typeof t.note === 'string' ? t.note.slice(0, 200) : '',
+    id: t.id, ts: +t.ts, type: t.type, asset: (t.type === 'deposit' || t.type === 'withdraw') ? 'USDT' : t.asset.toUpperCase(), qty: +t.qty,
+    price: (t.type === 'deposit' || t.type === 'withdraw') ? 1 : +t.price,
+    fee: (t.type === 'deposit' || t.type === 'withdraw') ? 0 : (t.fee > 0 ? +t.fee : 0), fx: t.fx > 0 ? +t.fx : null, note: typeof t.note === 'string' ? t.note.slice(0, 200) : '',
     u: t.u > 0 ? +t.u : 0,
   }));
   for (const id in (d.deleted || {})) if (d.deleted[id] > 0) out.deleted[id] = +d.deleted[id];
@@ -1850,7 +1883,7 @@ let lastPxCache = { v: -1, map: {} };
 function lastTradePx() {
   if (lastPxCache.v !== dataVersion) {
     const map = {};
-    for (const t of Engine.sortTx(data.txs)) map[t.asset] = t.price;
+    for (const t of Engine.sortTx(data.txs)) if (t.type === 'buy' || t.type === 'sell') map[t.asset] = t.price;
     lastPxCache = { v: dataVersion, map };
   }
   return lastPxCache.map;
@@ -2190,7 +2223,9 @@ function renderNotices(C) {
   if (data.settings.cur === 'TWD' && !fxEffective()) list.push(notice('尚未取得 USDT/TWD 匯率，暫以 USDT 顯示。可到「設定」手動輸入匯率。', ['開啟設定', openSettings]));
   if (C.result.issues.length) {
     const i = C.result.issues[0];
-    list.push(notice('有 ' + C.result.issues.length + ' 筆賣出超過當時持有量（例如 ' + i.asset + '），請檢查交易紀錄。'));
+    list.push(notice(i.kind === 'overwithdraw'
+      ? '有 ' + C.result.issues.length + ' 筆提領超過當時的 USDT 餘額，請檢查交易紀錄（可補一筆「存入」）。'
+      : '有 ' + C.result.issues.length + ' 筆賣出超過當時持有量（例如 ' + i.asset + '），請檢查交易紀錄。'));
   }
   if (syncSt.status === 'error' && syncSt.code !== 'NETWORK' && syncSt.code !== 'RATE') list.push(notice('雲端同步失敗：' + syncSt.error, ['重試', () => runSync('manual')]));
   activeAlerts().forEach((a) => {
@@ -2235,7 +2270,8 @@ function renderSummary(C) {
   const hasPct = S.rows.some((r) => r.pct != null);
   el.summary.appendChild(h('div', null,
     h('div', { class: 'hero-label' }, '總資產（市值）'),
-    h('div', { class: 'hero-value' }, fmtMoney(S.value, cur), unitSpan(cur)),
+    h('div', { class: 'hero-value' }, fmtMoney(S.totalValue, cur), unitSpan(cur)),
+    S.cash > 0 ? h('div', { class: 'hero-cash muted' }, '其中 USDT 餘額 ' + fmtMoney(S.cashValue, cur) + (cur === 'TWD' ? '' : ' USDT') + '（賣出所得與存入，提領後才會扣除）') : null,
     hasPct ? h('div', { class: 'hero-delta ' + signClass(S.dayChange) },
       pnlText(S.dayChange, cur) + (S.dayChangePct != null ? '（' + fmtPct(S.dayChangePct, true) + '）' : ''),
       h('span', { class: 'muted' }, '　24 小時')) : null));
@@ -2261,9 +2297,9 @@ function dayEnds(txs) {
   for (let d = utcDayStart(first); d + DAY - 1 < now; d += DAY) out.push(d + DAY - 1);
   return out;
 }
-function seriesOpts(C, days, nowTs) {
+function seriesOpts(C, days, nowTs, includeCash) {
   return {
-    method: C.method, days, nowTs, fxOf: C.fxOf, priceFx: C.fxNow,
+    method: C.method, days, nowTs, fxOf: C.fxOf, priceFx: C.fxNow, includeCash: !!includeCash,
     priceAt: (a, dayEnd) => {
       if (a === 'USDT') return 1;
       const hc = hist.closes[a];
@@ -2278,10 +2314,10 @@ function getSeries(C) {
   const now = Date.now();
   const key = [dataVersion, hist.version, C.cur, C.method, C.cur === 'TWD' ? C.fxNow.toFixed(4) : '', utcDayStart(now)].join('|');
   if (seriesCache.key !== key) {
-    const all = Engine.netWorthSeries(data.txs, seriesOpts(C, dayEnds(), now));
+    const all = Engine.netWorthSeries(data.txs, seriesOpts(C, dayEnds(), now, true));
     seriesCache = { key, pts: all.slice(0, -1) };
   }
-  const nowPt = Engine.netWorthSeries(data.txs, seriesOpts(C, [], now)).pop();
+  const nowPt = Engine.netWorthSeries(data.txs, seriesOpts(C, [], now, true)).pop();
   return seriesCache.pts.concat([nowPt]);
 }
 function renderChart() {
@@ -2332,6 +2368,7 @@ function renderChart() {
   if (hist.failed.length) notes.push('無法取得 ' + hist.failed.join('、') + ' 的歷史價格，曲線以該幣的成交價估算。');
   if (C.cur === 'TWD') notes.push('台幣曲線的市值以目前匯率換算，成本使用各筆交易記錄的匯率。');
   notes.push('歷史市值採用幣安每日（UTC）收盤價。');
+  if (C.summary.cash > 0) notes.push('曲線含 USDT 餘額（市值與成本各算一次，所以兩線差距仍是未實現損益）。');
   el.chart.appendChild(h('p', { class: 'foot' }, notes.join(' ')));
 }
 function chartTable(pts, cur) {
@@ -2550,7 +2587,7 @@ function barsTable(bars, cur) {
 /* ---------- 資產配置 ---------- */
 function assetOrder() {
   const first = {};
-  for (const t of Engine.sortTx(data.txs)) if (first[t.asset] == null) first[t.asset] = Object.keys(first).length;
+  for (const t of Engine.sortTx(data.txs)) if (!isCashTx(t) && first[t.asset] == null) first[t.asset] = Object.keys(first).length;
   return first;
 }
 function colorOf(order) {
@@ -2561,7 +2598,8 @@ function renderAlloc(C) {
   el.alloc.appendChild(h('div', { class: 'card-head' }, h('h2', null, '資產配置'), h('span', { class: 'card-sub' }, '依目前市值占比；明細見下方持倉表')));
   const body = h('div');
   el.alloc.appendChild(body);
-  allocBar(body, C.summary.rows, { cur: C.cur, colorOf: colorOf(assetOrder()) });
+  const rows = C.summary.cash > 0 ? C.summary.rows.concat([{ asset: 'USDT 餘額', value: C.summary.cashValue, isCash: true }]) : C.summary.rows;
+  allocBar(body, rows, { cur: C.cur, colorOf: colorOf(assetOrder()) });
 }
 
 /* ---------- 排序 / 篩選共用 ---------- */
@@ -2680,10 +2718,12 @@ function renderHoldings(C) {
 
   clear(el.holdHead);
   el.holdHead.appendChild(h('div', { class: 'card-head' }, h('h2', null, '持倉'),
-    h('span', { class: 'card-sub' }, '單位：' + (cur === 'TWD' ? 'TWD（價格與市值）' : 'USDT') + (active ? '　顯示 ' + shown.length + ' / ' + S.rows.length + ' 檔' : ''))));
+    h('span', { class: 'card-sub' }, '單位：' + (cur === 'TWD' ? 'TWD（價格與市值）' : 'USDT') + (active ? '　顯示 ' + shown.length + ' / ' + S.rows.length + ' 檔' : '')),
+    h('button', { class: 'btn small', type: 'button', onclick: () => openCashDialog() }, 'USDT 提領／存入')));
   clear(el.holdBody);
-  if (!S.rows.length) { el.holdBody.appendChild(h('p', { class: 'muted' }, '目前沒有持倉。')); return; }
-  if (!shown.length) { el.holdBody.appendChild(h('p', { class: 'muted' }, '沒有符合篩選條件的持倉。')); return; }
+  const showCash = S.cash > 0 && !uiState.hPnl && (!q || 'USDT'.indexOf(q) >= 0);
+  if (!S.rows.length && !(S.cash > 0)) { el.holdBody.appendChild(h('p', { class: 'muted' }, '目前沒有持倉。')); return; }
+  if (!shown.length && !showCash) { el.holdBody.appendChild(h('p', { class: 'muted' }, '沒有符合篩選條件的持倉。')); return; }
   const order = assetOrder(), col = colorOf(order);
   const rows = shown.map((r) => {
     const c = col(r.asset);
@@ -2710,10 +2750,21 @@ function renderHoldings(C) {
       h('td', { 'data-label': '預計收益', class: 'col-expprofit' },
         expectedProfit(r) != null ? arrow(expectedProfit(r)) + fmtSigned(expectedProfit(r), cur) + (expectedPct(r) != null ? '（' + fmtPct(expectedPct(r), true) + '）' : '') : '—'));
   });
+  const na = (label) => h('td', { 'data-label': label, class: 'na' }, '—');
+  const cashRow = showCash ? h('tr', { class: 'cashrow' },
+    h('td', { 'data-label': '幣種' }, h('span', { class: 'asset' }, h('span', { class: 'lg-box', style: { background: 'var(--col-cash)' } }), 'USDT 餘額')),
+    h('td', { 'data-label': '持有量' }, fmtQty(S.cash)),
+    na('平均成本'), na('成本金額'),
+    h('td', { 'data-label': '現價' }, fmtPrice(C.fxNow, cur)),
+    na('24h'),
+    h('td', { 'data-label': '市值' }, fmtMoney(S.cashValue, cur)),
+    h('td', { 'data-label': '占比' }, S.totalValue > 0 ? fmtPct(S.cashValue / S.totalValue) : '—'),
+    na('未實現損益'), na('已實現'), na('目標價'), na('預計收益')) : null;
+  if (cashRow) rows.push(cashRow);
   // 合計：沒篩選時用全部持倉（已實現含已清倉）；篩選時只加總顯示中的幣種
   const sum = (f) => shown.reduce((a, r) => a + (f(r) || 0), 0);
   const tCost = active ? sum((r) => r.cost) : S.rows.reduce((a, r) => a + r.cost, 0);
-  const tValue = active ? sum((r) => r.value) : S.value;
+  const tValue = active ? sum((r) => r.value) + (showCash ? S.cashValue : 0) : S.totalValue;
   const tUnreal = active ? sum((r) => r.unrealized) : S.unrealized;
   const tReal = active ? sum((r) => r.realized) : S.realized;
   const tfoot = h('tfoot', null, h('tr', null,
@@ -2752,7 +2803,8 @@ function buildTxBar() {
   const rerender = () => renderTx(lastC);
   const selA = h('select', { 'aria-label': '篩選幣種', onchange: (e) => { uiState.txAsset = e.target.value; rerender(); } });
   const selT = h('select', { 'aria-label': '篩選類型', onchange: (e) => { uiState.txType = e.target.value; rerender(); } },
-    h('option', { value: '' }, '買入與賣出'), h('option', { value: 'buy' }, '只看買入'), h('option', { value: 'sell' }, '只看賣出'));
+    h('option', { value: '' }, '全部類型'), h('option', { value: 'buy' }, '只看買入'), h('option', { value: 'sell' }, '只看賣出'),
+    h('option', { value: 'deposit' }, '只看存入'), h('option', { value: 'withdraw' }, '只看提領'));
   const q = searchInput('搜尋備註或幣種', 'tq', (v) => { uiState.txQ = v; rerender(); });
   const from = h('input', { type: 'date', 'aria-label': '起始日期', onchange: (e) => { uiState.txFrom = e.target.value; rerender(); } });
   const to = h('input', { type: 'date', 'aria-label': '結束日期', onchange: (e) => { uiState.txTo = e.target.value; rerender(); } });
@@ -2765,6 +2817,14 @@ function buildTxBar() {
     h('label', { class: 'dlab' }, '從', from), h('label', { class: 'dlab' }, '到', to),
     sort, dir, clr);
   return { node, selA, selT, q, from, to, sort, dir, clr, assetsKey: null };
+}
+function isCashTx(t) { return t.type === 'deposit' || t.type === 'withdraw'; }
+const TYPE_LABEL = { buy: '買入', sell: '賣出', deposit: '存入', withdraw: '提領' };
+/** 驗證不過時的說明（賣出超過持有量／提領超過餘額） */
+function issueMsg(i) {
+  return i.kind === 'overwithdraw'
+    ? '這樣會讓當時的 USDT 餘額不夠提領（缺 ' + fmtMoney(i.short, 'USDT') + ' USDT）。請先補上「存入」或調整金額。'
+    : '這樣會讓 ' + i.asset + ' 賣出時超過持有量（缺 ' + fmtQty(i.short) + '）。請先補上買入紀錄或調整數量。';
 }
 function renderTx(C) {
   C = C || lastC;
@@ -2812,20 +2872,21 @@ function renderTx(C) {
   const twd = cur === 'TWD';
   const rows = list.map((t) => {
     const ev = C.result.events[t.id];
+    const cashTx = isCashTx(t);
     return h('tr', { class: badIds[t.id] ? 'bad' : '' },
       h('td', { 'data-label': '時間', class: 'l' }, fmtDT(t.ts)),
-      h('td', { 'data-label': '類型', class: 'l' }, h('span', { class: 'tag ' + t.type }, t.type === 'buy' ? '買入' : '賣出')),
+      h('td', { 'data-label': '類型', class: 'l' }, h('span', { class: 'tag ' + t.type }, TYPE_LABEL[t.type] || t.type)),
       h('td', { 'data-label': '幣種', class: 'l' }, h('strong', null, t.asset)),
       h('td', { 'data-label': '數量' }, fmtQty(t.qty)),
-      h('td', { 'data-label': '價格 (USDT)' }, fmtPrice(t.price, 'USDT')),
+      h('td', { 'data-label': '價格 (USDT)' }, cashTx ? '—' : fmtPrice(t.price, 'USDT')),
       h('td', { 'data-label': '金額 (USDT)' }, fmtMoney(t.qty * t.price, 'USDT')),
       h('td', { 'data-label': '手續費 (USDT)' }, t.fee ? fmtMoney(t.fee, 'USDT') : '—'),
-      twd ? h('td', { 'data-label': '匯率' }, t.fx ? num(t.fx, 2, 4) : '現匯') : null,
+      twd ? h('td', { 'data-label': '匯率' }, cashTx ? '—' : t.fx ? num(t.fx, 2, 4) : '現匯') : null,
       h('td', { 'data-label': '已實現損益', class: ev && ev.type === 'sell' ? signClass(ev.pnl) : '' },
         ev && ev.type === 'sell' ? arrow(ev.pnl) + fmtSigned(ev.pnl, cur) : '—'),
       h('td', { 'data-label': '備註', class: 'l' }, t.note ? h('span', { class: 'note', title: t.note }, t.note) : '—'),
       h('td', { class: 'act' },
-        h('button', { class: 'btn icon small', type: 'button', 'aria-label': '編輯這筆交易', title: '編輯', onclick: () => openTxDialog(t) }, icon('edit', 16)),
+        h('button', { class: 'btn icon small', type: 'button', 'aria-label': '編輯這筆交易', title: '編輯', onclick: () => (isCashTx(t) ? openCashDialog(t) : openTxDialog(t)) }, icon('edit', 16)),
         ' ',
         h('button', { class: 'btn icon small danger', type: 'button', 'aria-label': '刪除這筆交易', title: '刪除', onclick: () => deleteTx(t) }, icon('trash', 16))));
   });
@@ -2855,14 +2916,18 @@ function applyTxs(next) {
 function deleteTx(t) {
   confirmDialog({
     title: '刪除這筆交易？',
-    body: fmtDT(t.ts) + '　' + (t.type === 'buy' ? '買入 ' : '賣出 ') + fmtQty(t.qty) + ' ' + t.asset + ' @ ' + fmtPrice(t.price, 'USDT') + ' USDT。刪除後無法復原。',
+    body: fmtDT(t.ts) + '　' + (isCashTx(t)
+      ? TYPE_LABEL[t.type] + ' ' + fmtMoney(t.qty, 'USDT') + ' USDT'
+      : (t.type === 'buy' ? '買入 ' : '賣出 ') + fmtQty(t.qty) + ' ' + t.asset + ' @ ' + fmtPrice(t.price, 'USDT') + ' USDT') + '。刪除後無法復原。',
     confirm: '刪除', danger: true,
   }).then((ok) => {
     if (!ok) return;
     const next = data.txs.filter((x) => x.id !== t.id);
     const issues = Engine.replay(next, { method: 'avg' }).issues;
     if (issues.length) {
-      alertDialog('無法刪除', '刪除後，' + issues[0].asset + ' 之後的賣出數量會超過持有量。請先調整或刪除相關的賣出紀錄。');
+      alertDialog('無法刪除', issues[0].kind === 'overwithdraw'
+        ? '刪除後，之後的提領會超過當時的 USDT 餘額。請先調整或刪除相關的提領紀錄。'
+        : '刪除後，' + issues[0].asset + ' 之後的賣出數量會超過持有量。請先調整或刪除相關的賣出紀錄。');
       return;
     }
     applyTxs(next);
@@ -2936,7 +3001,7 @@ function openTxDialog(edit) {
       const nt = { id: edit ? edit.id : uid(), ts, type, asset, qty, price, fee, fx, note: inNote.value.trim().slice(0, 200) };
       const next = edit ? data.txs.map((x) => (x.id === nt.id ? nt : x)) : data.txs.concat([nt]);
       const issues = Engine.replay(next, { method: 'avg' }).issues;
-      if (issues.length) return fail('這樣會讓 ' + issues[0].asset + ' 賣出時超過持有量（缺 ' + fmtQty(issues[0].short) + '）。請先補上買入紀錄或調整數量。');
+      if (issues.length) return fail(issueMsg(issues[0]));
       close(true);
       applyTxs(next);
       toast(edit ? '已更新' : '已新增');
@@ -2944,7 +3009,7 @@ function openTxDialog(edit) {
 
     return [
       h('h2', null, edit ? '編輯交易' : '新增交易'),
-      h('p', { class: 'lead' }, '現貨買賣；價格與手續費以 USDT 計。'),
+      h('p', { class: 'lead' }, '現貨買賣；價格與手續費以 USDT 計。賣出所得會自動計入「USDT 餘額」，買入會先用餘額支付（不足的部分視為帳本外的資金）。'),
       h('div', { class: 'field' }, h('span', { class: 'flabel' }, '類型'), h('div', { class: 'segctl', role: 'radiogroup', 'aria-label': '類型' }, btnBuy, btnSell)),
       h('div', { class: 'row2' }, field('幣種', inAsset, null, 'f-asset'), field('時間', inTs, null, 'f-ts')),
       h('datalist', { id: 'f-assets' }, known.map((a) => h('option', { value: a }))),
@@ -2954,6 +3019,51 @@ function openTxDialog(edit) {
       h('div', { class: 'row2' }, field('手續費 (USDT)', inFee, '用 BNB 或該幣扣除時，請換算成 USDT', 'f-fee'),
         field('當時 USDT/TWD 匯率', inFx, '選填；填了才能在台幣模式反映匯差', 'f-fx')),
       field('備註', inNote, null, 'f-note'),
+      err,
+      h('div', { class: 'dlg-actions' },
+        h('button', { class: 'btn', type: 'button', onclick: () => close(false) }, '取消'),
+        h('button', { class: 'btn primary', type: 'button', onclick: save }, '儲存')),
+    ];
+  });
+}
+
+/* ---------- USDT 提領 / 存入 ---------- */
+function openCashDialog(edit) {
+  const t = edit || { type: 'withdraw', ts: Date.now(), qty: '', note: '' };
+  return modal((close) => {
+    let type = t.type;
+    const inTs = h('input', { id: 'c-ts', type: 'datetime-local', value: toLocalInput(t.ts) });
+    const inQty = numInput('c-qty', t.qty, '0.00');
+    const inNote = h('input', { id: 'c-note', type: 'text', value: t.note || '', maxlength: 200, placeholder: '選填' });
+    const err = h('div', { class: 'err', role: 'alert' });
+    const btnW = h('button', { type: 'button', role: 'radio' }, '提領');
+    const btnD = h('button', { type: 'button', role: 'radio' }, '存入');
+    const paintType = () => { btnW.setAttribute('aria-checked', String(type === 'withdraw')); btnD.setAttribute('aria-checked', String(type === 'deposit')); };
+    btnW.addEventListener('click', () => { type = 'withdraw'; paintType(); });
+    btnD.addEventListener('click', () => { type = 'deposit'; paintType(); });
+    paintType();
+    const cashNow = lastC ? lastC.summary.cash : 0;
+    const save = () => {
+      err.textContent = '';
+      const ts = new Date(inTs.value).getTime();
+      if (!isFinite(ts)) { err.textContent = '請選擇有效的時間。'; return; }
+      if (ts > Date.now() + 5 * 60000) { err.textContent = '時間不能晚於現在。'; return; }
+      const qty = parseFloat(inQty.value);
+      if (!(qty > 0)) { err.textContent = '金額必須大於 0。'; return; }
+      const nt = { id: edit ? edit.id : uid(), ts, type, asset: 'USDT', qty, price: 1, fee: 0, fx: null, note: inNote.value.trim().slice(0, 200) };
+      const next = edit ? data.txs.map((x) => (x.id === nt.id ? nt : x)) : data.txs.concat([nt]);
+      const issues = Engine.replay(next, { method: 'avg' }).issues;
+      if (issues.length) { err.textContent = issueMsg(issues[0]); return; }
+      close(true);
+      applyTxs(next);
+      toast(edit ? '已更新' : type === 'withdraw' ? '已記錄提領' : '已記錄存入');
+    };
+    return [
+      h('h2', null, edit ? '編輯 USDT 提領／存入' : 'USDT 提領／存入'),
+      h('p', { class: 'lead' }, '提領 = USDT 離開這本帳（轉出到別處、換成台幣等），餘額與總資產會扣掉；存入 = 從帳本外轉進來的 USDT。目前 USDT 餘額：' + fmtMoney(cashNow, 'USDT') + ' USDT。'),
+      h('div', { class: 'field' }, h('span', { class: 'flabel' }, '類型'), h('div', { class: 'segctl', role: 'radiogroup', 'aria-label': '類型' }, btnW, btnD)),
+      h('div', { class: 'row2' }, field('金額 (USDT)', inQty, null, 'c-qty'), field('時間', inTs, null, 'c-ts')),
+      field('備註', inNote, null, 'c-note'),
       err,
       h('div', { class: 'dlg-actions' },
         h('button', { class: 'btn', type: 'button', onclick: () => close(false) }, '取消'),
@@ -3647,7 +3757,7 @@ function exportCsv() {
   const head = ['時間', '類型', '幣種', '數量', '價格(USDT)', '手續費(USDT)', '匯率(USDT/TWD)', '備註'];
   const lines = [head.map(csvCell).join(',')];
   Engine.sortTx(data.txs).forEach((t) => {
-    lines.push([fmtDT(t.ts), t.type === 'buy' ? '買入' : '賣出', t.asset, t.qty, t.price, t.fee || 0, t.fx || '', t.note || ''].map(csvCell).join(','));
+    lines.push([fmtDT(t.ts), ({ buy: '買入', sell: '賣出', deposit: '存入', withdraw: '提領' }[t.type] || t.type), t.asset, t.qty, t.price, t.fee || 0, t.fx || '', t.note || ''].map(csvCell).join(','));
   });
   download('crypto-ledger-' + stampName() + '.csv', '﻿' + lines.join('\r\n'), 'text/csv;charset=utf-8');
   toast('已匯出 CSV');
